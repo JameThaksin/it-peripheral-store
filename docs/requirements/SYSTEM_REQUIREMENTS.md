@@ -1,6 +1,6 @@
 # System Requirements — IT Peripheral Store
 
-Status: Draft v2 (M1-003, remediates Codex M1-002 audit) · Owner: team · Last updated: 2026-11-15
+Status: Draft v3 (M1-005, remediates Codex M1-002 and M1-004 audits) · Owner: team · Last updated: 2026-11-15
 
 ## 0. Sources and labels
 
@@ -156,39 +156,47 @@ Admin logs in through the same `/login` page; the UI shows admin navigation only
 | BR-05 | Stock is decremented atomically with `stock >= qty` as a condition; stock can never go negative. If any line fails, the whole order fails and no stock changes (transaction). |
 | BR-06 | Only `isActive: true` products can be ordered. |
 | BR-07 | No payment is captured. New orders start as `pending`. Admin moves them through `pending → confirmed → shipped → delivered`; admin may cancel from `pending` or `confirmed`; customer may cancel own order only from `pending`. Each transition is a conditional write on the current status (ADR-002 D6). |
-| BR-08 | Cancelling an order restores its stock in the same transaction, and **only** the transaction that actually changed the status restores stock, so stock is restored at most once. |
+| BR-08 | Cancelling an order restores its stock in the same transaction, and **only** the transaction that actually changed the status restores stock, so stock is restored at most once. Restoration is never blocked by the admin stock cap; no unit is ever discarded (DATABASE_DESIGN §7.4). |
 | BR-09 | Shipping fee: flat rate from config (`SHIPPING_FEE_SATANG`, default 5000 = ฿50), free when subtotal ≥ `FREE_SHIPPING_THRESHOLD_SATANG`. Values are assumptions, adjustable. |
 | BR-10 | Products are never hard-deleted through the API; delete = deactivate. Orders therefore never reference a missing product. |
 | BR-11 | `/api/orders/*` returns only the caller's own orders (admins included); all-order access is only via `/api/admin/orders/*`. |
 | BR-12 | Order numbers are human-readable (`ORD-YYYYMMDD-XXXXXX`) and unique. |
-| BR-13 | Admin stock changes are relative (`stockAdjust`) or preconditioned (`stockSet` + `expectedStock`); a stale absolute value is rejected with `409 STOCK_CONFLICT` and never overwrites sales. |
-| BR-14 | Each checkout carries a client idempotency key (UUID v4). Within 24 h the same key with the same payload returns the original order; with a different payload it is rejected (`422`). After 24 h the key may be used again. Stock is decremented at most once per accepted order. |
+| BR-13 | Every stock mutation increments the product's `inventoryRevision`. Admin stock changes are relative (`stockAdjust`) or absolute with the observed revision (`stockSet` + `expectedRevision`); an absolute correction made after **any** intervening stock change is rejected with `409 STOCK_CONFLICT`, even if the stock number happens to match. Admins cannot raise stock above 1,000,000. |
+| BR-14 | Each checkout carries a client idempotency key (UUID v4). Within 24 h the same key with the same payload returns the original order; with a different payload it is rejected (`422`). After 24 h the key may be used again. Stock is decremented at most once per accepted order. Concurrent duplicates, duplicate-key errors and uncertain commits are resolved by re-reading the key record outside the aborted transaction; if the server cannot resolve the outcome within its retry budget it returns `503 CHECKOUT_RETRY`, and retrying with the same key is safe. |
 | BR-15 | Order total ≤ 1,000,000,000 satang (฿10 M); larger orders are rejected with `422 ORDER_LIMIT_EXCEEDED`. |
-| BR-16 | A product can be assigned only to an active category; a category can be deactivated only when it has no active products. |
+| BR-16 | Every active product belongs to an active category. A category can be deactivated only via DELETE and only when it has no active products; category PATCH cannot change `isActive`. Inactive products may reference inactive categories but cannot be reactivated until their category is active. |
 
-## 7. Acceptance criteria for M1-002 audit findings
+## 7. Acceptance criteria for audit findings (M1-002, M1-004)
 
 Each criterion is an automated test unless marked *manual*. Test level: **I** = integration (Supertest + replica-set MongoDB), **E** = E2E (Playwright).
 
 | AC | Finding | Criterion | Level |
 |---|---|---|---|
-| AC-F01a | F01 | Stock 10. Interleave: admin reads 10 → checkout buys 3 (stock 7) → admin sends `stockSet: 15, expectedStock: 10`. Result `409 STOCK_CONFLICT`, stock stays 7. | I |
-| AC-F01b | F01 | Stock 7; concurrently checkout buys 2 and admin sends `stockAdjust: +5`. Final stock = 10 (both changes kept). | I |
-| AC-F01c | F01 | `stockAdjust: -20` on stock 7 → `409 STOCK_CONFLICT`, stock unchanged. PATCH with plain `stock` field → `400 VALIDATION_ERROR`. | I |
+| AC-F01a | F01, N02 | Admin reads (stock 10, rev r) → checkout buys 3 (7, r+1) → `stockAdjust +3` (10, r+2) → admin sends `stockSet: 15, expectedRevision: r`. Result `409 STOCK_CONFLICT` with `currentRevision: r+2`, although stock equals 10 again; stock stays 10. | I |
+| AC-F01d | F01, N02 | Every stock-changing operation (checkout, cancellation, `stockAdjust` ±, `stockSet`) increases `inventoryRevision` by exactly 1 per affected product; non-stock edits (price, name) leave it unchanged. | I |
+| AC-F01b | F01 | Stock 7; concurrently checkout buys 2 and admin sends `stockAdjust: +5`. Final stock = 10 (both changes kept), revision +2. | I |
+| AC-F01c | F01 | `stockAdjust: -20` on stock 7 → `409`; `stockAdjust` taking stock above 1,000,000 → `409`; stock and revision unchanged. PATCH with plain `stock`, or `stockSet` without `expectedRevision` → `400 VALIDATION_ERROR`. | I |
 | AC-F02a | F02 | 5 parallel identical checkouts with one key → exactly one order exists, stock decremented once; all 5 responses carry the same `orderNumber` (one `201`, the rest `200`). | I |
 | AC-F02b | F02 | Same key, different items → `422 IDEMPOTENCY_KEY_REUSED`, no order, no stock change. | I |
 | AC-F02c | F02 | Same key after the record's `expiresAt` (clock advanced in test) → new order created (`201`). | I |
+| AC-F02d | F02, N03 | Forced duplicate-key path: request B's transaction is held until A commits, then B's insert raises `E11000` → B returns A's order (`200`, same fingerprint) or `422` (different fingerprint); one order, one decrement. Forced winner abort: A aborts (`OUT_OF_STOCK` injected after its key insert) → B completes with `201`. | I |
+| AC-F02e | F02, N03 | Forced uncertain commit (fault injection returns `UnknownTransactionCommitResult` after a real commit) → the response is `201` with the committed order and no second order exists; injected failure before commit → retried, one order. Injected `E11000` on an unrelated index → `500`, no order. Retry budget exhausted → `503 CHECKOUT_RETRY`, and a follow-up request with the same key succeeds exactly once. | I |
 | AC-F03a | F03 | For every write endpoint, a top-level unknown field (e.g. `role`, `priceSatang`) → `400 VALIDATION_ERROR` with `details[].path`, and no DB write. | I |
 | AC-F03b | F03 | Unknown nested field (e.g. `shippingAddress.isAdmin`, `items[0].unitPriceSatang`) and unknown query param (e.g. `?foo=1`) → `400 VALIDATION_ERROR`. | I |
 | AC-F04 | F04 | `GET /api/orders/:n`: guest 401, owner 200, other customer 404, admin (not owner) 404. `GET /api/admin/orders/:n`: guest 401, customer 403, admin 200. | I |
 | AC-F05 | F05 | Two lines of 6 for the same product → `400 VALIDATION_ERROR` (merged qty 12 > 10) on both `/cart/quote` and `/orders`; no stock change. Two lines of 4 → one merged line of 8. | I |
 | AC-F06 | F06 | `DELETE /api/admin/products/:id`: active product (with or without orders) → `200 {isActive:false, deletedAt}`; repeat → same `200`; unknown id → `404`. The product document still exists. | I |
 | AC-R01 | R01 | Parallel checkout and deactivation of the same product (20 runs): every run ends either with a committed order and an inactive product, or with `409 PRODUCT_UNAVAILABLE` and no order. No order ever references a missing product. | I |
-| AC-R02 | R02 | Pending order with 2 units: parallel customer cancel + admin cancel + admin confirm → exactly one succeeds; stock restored ≤ once; `statusHistory` has one entry after `pending`. | I |
+| AC-R02a | R02, N05 | Pending order (2 units): parallel customer cancel + admin cancel → exactly one `200`, the other `409 INVALID_STATUS_TRANSITION`; stock restored exactly once (+2, revision +1); history `pending → cancelled`. | I |
+| AC-R02b | R02, N05 | Pending order: parallel admin confirm + admin cancel (repeat 20×). Each run must match one serial ordering: (i) confirm then cancel → both `200`, history `pending → confirmed → cancelled`; or (ii) cancel then confirm → cancel `200`, confirm `409`, history `pending → cancelled`. In both, final status `cancelled` and stock restored exactly once. | I |
+| AC-R02c | R02, N05 | Pending order: parallel customer cancel + admin confirm. Allowed: (i) cancel `200`, confirm `409`, stock restored once; or (ii) confirm `200`, customer cancel `409` (customers cancel only from `pending`), stock not restored. Never two restorations. | I |
+| AC-R02d | R02, N04 | Stock 10 → order of 4 (stock 6) → admin `stockAdjust` up to the cap (1,000,000) → cancel the order → `200`, stock 1,000,004, no unit lost; a following admin `stockAdjust +1` → `409` (above cap), `stockAdjust -4` → `200`. | I |
 | AC-R03 | R03 | Boundary writes through Mongoose: `priceSatang` 1 and 10,000,000 accepted, 0 / 10,000,001 / 1.5 rejected; stored BSON type is `int` (`$type: "int"`). Order exceeding total cap → `422 ORDER_LIMIT_EXCEEDED`. | I |
 | AC-R04 | R04 | Flow: `GET /auth/csrf` → `POST /auth/login` with token → response has new `csrfToken` → write with old token `403 CSRF_INVALID`, with new token succeeds → logout → write with that token `403`. Login without token → `403`. | I |
-| AC-R05a | R05 | Parallel "deactivate category" and "create product in that category": exactly one succeeds (`409 CATEGORY_HAS_ACTIVE_PRODUCTS` or `409 CATEGORY_UNAVAILABLE`); `activeProductCount` equals the actual count afterwards. | I |
+| AC-R05a | R05, N06 | Category with 0 active products. Race `DELETE /admin/categories/:id` (repeat 20× each) against each of: create active product in it, reactivate an inactive product in it, move an active product into it. Exactly one of each pair succeeds (`409 CATEGORY_HAS_ACTIVE_PRODUCTS` or `409 CATEGORY_UNAVAILABLE`), and `db:verify` reports no drift and no active product in an inactive category. | I |
+| AC-R05c | R05, N06 | `PATCH /admin/categories/:id` with `isActive: false` (or `true`) → `400 VALIDATION_ERROR`, no change. `POST /reactivate` on an inactive category → `200`; its products remain inactive; reactivating one of them then succeeds. Creating an inactive product in an inactive category → `201`; reactivating it while the category is inactive → `409 CATEGORY_UNAVAILABLE`. | I |
 | AC-R05b | R05 | Renaming a category slug requires no product update, and `?category=<newSlug>` returns its products. | I |
-| AC-R06a | R06 | On a clean Windows 11 machine, following DEPLOYMENT_DESIGN §2 from a fresh clone, the developer reaches a running app, and `npm run test:integration` passes its transaction smoke test. | manual + I |
+| AC-R06a | R06 | On a clean Windows 11 machine, following DEPLOYMENT_DESIGN §2 from a fresh clone: `npm run db:up` returns only after the healthcheck reports a writable primary; migrations and seed succeed; the app starts; `npm run test:integration` passes its transaction smoke test. | manual + I |
+| AC-N01 | N01, R06 | `docker compose port mongo 27017` prints `127.0.0.1:27017`; a connection attempt to port 27017 from another machine on the same network fails, while the local smoke test passes. | manual |
 | AC-R06b | R06 | Staging smoke test over HTTPS on the chosen same-origin topology: login, add to cart, checkout, logout. | E |
 | AC-F07 | F07 | Landing, About, catalog, product, cart, checkout and admin product list at 360, 375, 576, 768, 992, 1200 and 1440 px: `document.documentElement.scrollWidth <= window.innerWidth`, the navbar is usable, and no content is clipped. | E |

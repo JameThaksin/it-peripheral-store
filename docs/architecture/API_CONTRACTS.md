@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v2 (M1-003). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v3 (M1-005). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -41,14 +41,16 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `OUT_OF_STOCK` | `details` = `[{productId, requested, available}]` |
 | 409 | `PRODUCT_UNAVAILABLE` | Inactive / deleted product in cart |
 | 409 | `INVALID_STATUS_TRANSITION` | Order status rule violated, or a concurrent change won; `details.currentStatus` |
-| 409 | `STOCK_CONFLICT` | `expectedStock` stale, or the adjustment would leave stock outside 0–1,000,000; `details.currentStock` |
+| 409 | `STOCK_CONFLICT` | `expectedRevision` stale, or a `stockAdjust` would go below 0 or above the admin cap 1,000,000; `details.currentStock`, `details.currentRevision` |
 | 409 | `CATEGORY_UNAVAILABLE` | Product assigned to an inactive or missing category |
 | 409 | `CATEGORY_HAS_ACTIVE_PRODUCTS` | Category delete while active products remain |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within 24 h |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
+| 500 | `INVENTORY_OVERFLOW` | Cancellation restore would exceed the int32 stock limit (practically unreachable); transaction aborted, nothing changed, logged for manual action (DATABASE_DESIGN §7.4) |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked |
+| 503 | `CHECKOUT_RETRY` | Checkout couldn't be completed within its retry budget; nothing committed for this key, or the outcome will be replayed; `Retry-After` header. Retrying with the same idempotency key is safe |
 
 ## 2. Endpoint index
 
@@ -77,7 +79,9 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | PATCH | `/api/admin/products/:id` | admin | Update | B07 |
 | DELETE | `/api/admin/products/:id` | admin | Delete = deactivate (always soft) | B07 |
 | GET/POST | `/api/admin/categories` | admin | List / create | E03 |
-| PATCH/DELETE | `/api/admin/categories/:id` | admin | Update / delete = deactivate (blocked while active products) | E03 |
+| PATCH | `/api/admin/categories/:id` | admin | Update name/slug/description/sortOrder (**not** `isActive`) | E03 |
+| DELETE | `/api/admin/categories/:id` | admin | Deactivate: the only deactivation path; blocked while active products remain | E03 |
+| POST | `/api/admin/categories/:id/reactivate` | admin | Reactivate a category | E03 |
 | GET | `/api/admin/orders` | admin | All orders, filter by status | E04 |
 | GET | `/api/admin/orders/:orderNumber` | admin | Detail | E04 |
 | PATCH | `/api/admin/orders/:orderNumber/status` | admin | Change status | E04 |
@@ -212,14 +216,17 @@ Schema (strict at every level): `items` normalized as above; `shippingAddress` (
 | Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is committed |
 | Same key after 24 h | Treated as new → `201` |
 | Checkout fails (stock, validation) | Nothing stored; the same key may be retried |
+| Server retry budget exhausted or commit outcome unknown | Server resolves an uncertain commit by re-reading the key record; if still unresolved → `503 CHECKOUT_RETRY`, and a retry with the same key replays or creates exactly once |
+
+The server-side algorithm, including duplicate-key and uncertain-commit recovery outside the aborted transaction, is in DATABASE_DESIGN §7.2.
 
 Clients generate a new key for each checkout attempt the user starts, and reuse it on network retries and double clicks.
 
-Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`.
+Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`, `503 CHECKOUT_RETRY`.
 
 **GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only.
 **GET `/api/orders/:orderNumber`** → the caller's own order; `404` for any order the caller doesn't own, **including for admins** (F04).
-**POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once. `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
+**POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once and is never blocked by the admin stock cap. `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
 
 ### 3.4 Admin
 
@@ -239,17 +246,19 @@ All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (wr
 }
 ```
 
-→ `201 { data: Product }`. `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
+→ `201 { data: Product }` (includes `stock` and `inventoryRevision: 0`). `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
 
-**PATCH `/api/admin/products/:id`**: partial update of the create fields **except `stock`**, plus exactly one optional stock operation (F01, DATABASE_DESIGN §7.1):
+Admin product reads (`GET /api/admin/products`, `/:id`) and every admin product response include `stock` and `inventoryRevision`.
+
+**PATCH `/api/admin/products/:id`**: partial update of the create fields **except `stock`**, plus at most one stock operation (F01, N02, DATABASE_DESIGN §7.1). Every stock change increments `inventoryRevision`:
 
 | Body | Meaning | Conflict |
 |---|---|---|
-| `{ "stockAdjust": 10 }` | Atomic `+10` (negative to remove) | `409 STOCK_CONFLICT` if the result would leave 0–1,000,000 |
-| `{ "stockSet": 40, "expectedStock": 37 }` | Absolute count, only if stock is still 37 | `409 STOCK_CONFLICT { currentStock }` if it changed |
+| `{ "stockAdjust": 10 }` | Atomic `+10` (negative to write off); never conflicts with checkout | `409 STOCK_CONFLICT` if the result would be < 0, or > 1,000,000 for an increase |
+| `{ "stockSet": 40, "expectedRevision": 7 }` | Absolute count (0–1,000,000), only if no stock mutation happened since the admin read revision 7 | `409 STOCK_CONFLICT { currentStock, currentRevision }` if the revision changed, even when the stock number matches |
 | `{ "stock": 40 }` | Not allowed | `400 VALIDATION_ERROR` |
 
-Sending both `stockAdjust` and `stockSet` → `400`. Changing `categoryId`, or `isActive: true` on an inactive product, follows DATABASE_DESIGN §7.5 (`409 CATEGORY_UNAVAILABLE`). `isActive: false` behaves like DELETE.
+Sending both `stockAdjust` and `stockSet`, or `stockSet` without `expectedRevision` → `400`. Changing `categoryId`, or `isActive: true` on an inactive product, follows DATABASE_DESIGN §7.5 (`409 CATEGORY_UNAVAILABLE`). `isActive: false` behaves like DELETE.
 
 **DELETE `/api/admin/products/:id`** (F06, R01): always a soft delete, whether or not the product has orders.
 
@@ -259,7 +268,13 @@ Sending both `stockAdjust` and `stockSet` → `400`. Changing `categoryId`, or `
 | Already inactive | `200`, same body (original `deletedAt`) | Unchanged (idempotent) |
 | Unknown id | `404 NOT_FOUND` | — |
 
-**DELETE `/api/admin/categories/:id`**: deactivate if `activeProductCount = 0` → `200 { data: { id, isActive: false, deletedAt } }`. Active products remain → `409 CATEGORY_HAS_ACTIVE_PRODUCTS`. Already inactive → `200`. Unknown → `404`. Category bodies (strict): `name`, `slug`, `description`, `sortOrder`, `isActive`; `parentId` and `activeProductCount` are rejected.
+**DELETE `/api/admin/categories/:id`**: deactivate if `activeProductCount = 0` → `200 { data: { id, isActive: false, deletedAt } }`. Active products remain → `409 CATEGORY_HAS_ACTIVE_PRODUCTS`. Already inactive → `200`. Unknown → `404`.
+
+**POST `/api/admin/categories`** (strict): `name`, `slug`, `description`, `sortOrder`. New categories are active.
+
+**PATCH `/api/admin/categories/:id`** (strict): `name`, `slug`, `description`, `sortOrder` only. `isActive`, `parentId`, `activeProductCount` and `deletedAt` are rejected with `400 VALIDATION_ERROR`, so deactivation can only happen through DELETE (N06).
+
+**POST `/api/admin/categories/:id/reactivate`** (empty strict body) → `200 { data: Category }`; already active → `200`, unchanged; unknown → `404`. Products in the category stay inactive until each is reactivated (DATABASE_DESIGN §7.5).
 
 **GET `/api/admin/orders`**: query `status`, `q` (orderNumber or customer email), `from`, `to`, paging.
 

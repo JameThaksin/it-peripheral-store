@@ -1,6 +1,6 @@
 # Deployment Design — IT Peripheral Store
 
-Status: Draft v2 (M1-003). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
+Status: Draft v3 (M1-005). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
 
 ## 1. Environments
 
@@ -52,7 +52,7 @@ git clone https://github.com/JameThaksin/it-peripheral-store.git
 cd it-peripheral-store
 npm ci                          # installs all workspaces
 cp .env.example .env            # Windows PowerShell: Copy-Item .env.example .env ; then fill SESSION_SECRET etc.
-npm run db:up                   # docker compose up -d --wait mongo  (starts + initiates rs0, waits for healthy)
+npm run db:up                   # docker compose up -d --wait mongo  (starts, initiates rs0, returns only when the primary is writable)
 npm run db:migrate              # collections, validators, indexes
 npm run db:seed                 # ≥ 30 products, categories, admin from SEED_ADMIN_* vars
 npm run dev                     # builds packages/shared, then runs api (:4000) + web (:5173) concurrently
@@ -61,25 +61,27 @@ npm run test:integration        # includes the transaction smoke test (checkout 
 
 Workspace build order: `packages/shared` → `apps/api` → `apps/web`, enforced by `npm run build` (`npm run build -w packages/shared && npm run build -w apps/api && npm run build -w apps/web`).
 
-`docker-compose.yml` (to be added in M2) defines the single-node replica set with automatic initiation:
+`docker-compose.yml` (to be added in M2) defines the single-node replica set. The port is published on **loopback only** (N01), and the healthcheck succeeds only once the node is a **writable primary**, not merely initiated:
 
 ```yaml
 services:
   mongo:
     image: mongo:8
     command: ["--replSet", "rs0", "--bind_ip_all"]
-    ports: ["27017:27017"]
+    ports: ["127.0.0.1:27017:27017"]   # loopback only; never "27017:27017" (that publishes on all host interfaces)
     volumes: ["mongo-data:/data/db"]
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval",
-             "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}).ok }"]
+             "try { rs.status() } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}) }; if (!db.hello().isWritablePrimary) { quit(1) }"]
       interval: 5s
       retries: 30
 volumes:
   mongo-data:
 ```
 
-Local `MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0`. The member host is `localhost:27017`, so both the host machine and the container resolve it. No credentials are used locally; the port is bound to the developer's machine only.
+Local `MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0`. The member host is `localhost:27017`, so both the host machine and the container resolve it.
+
+Network exposure: `--bind_ip_all` applies **inside** the container (needed for Docker's port forwarding). Exposure to the host network is controlled by the published address `127.0.0.1`, so only processes on the developer's own machine can connect. Verify with `docker compose port mongo 27017` (must print `127.0.0.1:27017`) and AC-N01. The local database has no authentication, which is acceptable only because of this loopback binding and because it holds seed data only. If remote or cross-container access is ever needed, enable MongoDB authentication (`MONGO_INITDB_ROOT_USERNAME`/`PASSWORD` from `.env`, plus a keyfile for the replica set) before changing the binding.
 
 ### 2.3 Atlas-only alternative (no Docker)
 
@@ -87,7 +89,7 @@ Create a personal Atlas M0 cluster, add your IP to the access list, create a `re
 
 ### 2.4 Acceptance
 
-AC-R06a and AC-R06b (SYSTEM_REQUIREMENTS §7). The M2 foundation task must run the steps above on a clean Windows 11 machine and record the results in its handoff.
+AC-R06a, AC-R06b and AC-N01 (SYSTEM_REQUIREMENTS §7). The M2 foundation task must run the steps above on a clean Windows 11 machine and record the actual results in its handoff. Until then this setup is a **design**, not a verified procedure.
 
 ## 3. Hosting and topology
 
@@ -96,6 +98,8 @@ AC-R06a and AC-R06b (SYSTEM_REQUIREMENTS §7). The M2 foundation task must run t
 | Component | Requirements | Candidate providers (choice still open, any meets the topology) |
 |---|---|---|
 | App service (SPA + API) | Long-running Node 22 process, env-var secrets, HTTPS termination, health check on `/api/health`, stable egress IP preferred | Render, Railway, Fly.io, Azure App Service, a university VM |
+
+**Provider selection (open team decision, needed before staging).** Criteria, in order: (1) runs one long-lived Node 22 service with HTTPS on a single origin; (2) supports secret env vars; (3) offers static or published egress IPs so the Atlas access list can stay narrow (SECURITY_MODEL §3.5). A provider without fixed egress IPs forces a wide Atlas access list, which is acceptable for staging only if documented in an ADR with compensating controls (strong per-environment DB user, TLS, no production data); (4) free or student tier. The choice is recorded in ADR-003 when made.
 | Database | MongoDB 7+/8 replica set (transactions) | MongoDB Atlas (M0 for coursework; M10+ for real production) |
 
 ## 4. Environment variables

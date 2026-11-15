@@ -1,6 +1,6 @@
 # ADR-001: Technology Stack and Architecture Style
 
-- Status: **Accepted as the M2 baseline** by the project owner (M1-003, 2026-11-15); formal sign-off by all four team members pending
+- Status: **Proposed**, used as the working baseline at the project owner's direction (M1-003, 2026-11-15). Formal approval by all four team members is pending and required by AGENTS.md before it counts as accepted.
 - Date: 2026-11-14 (updated 2026-11-15)
 - Task: M1-001, amended by M1-003 (R06)
 
