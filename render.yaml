@@ -1,0 +1,19 @@
+# Render Blueprint: one same-origin Node web service (API + built React app).
+# Secrets are NOT stored here: set MONGODB_URI in the Render dashboard (sync: false).
+services:
+  - type: web
+    name: it-peripheral-store
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: MONGODB_DB_NAME
+        value: itps_prod
+      - key: MONGODB_URI
+        sync: false
