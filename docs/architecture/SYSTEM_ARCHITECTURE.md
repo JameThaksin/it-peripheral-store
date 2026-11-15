@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v8 (M1-015). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v9 (M1-017). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -119,7 +119,7 @@ sequenceDiagram
   E->>E: helmet, rate-limit, session, csrf, requireAuth, validate(CreateOrder, strict)
   E->>S: createOrder(userId, dto)
   S->>S: normalize lines (merge duplicates, then check qty 1–10), fingerprint
-  S->>DB: resolveKey: majority read checkoutKeys {userId, key}, then orders {userId, idempotencyKey} (no key-age check)
+  S->>DB: authorizedResolve: txn {users fence (isActive) ; read checkoutKeys, then orders} commit majority (0 → 403; no key-age check)
   alt order or closed record found
     S-->>E: replay (200) / 422 within replayUntil; else 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED); read failure → 503 UNKNOWN
   else nothing found

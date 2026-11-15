@@ -1,6 +1,6 @@
 # Deployment Design — IT Peripheral Store
 
-Status: Draft v6 (M1-015). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
+Status: Draft v7 (M1-017). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
 
 ## 1. Environments
 
@@ -112,7 +112,7 @@ Names only; values go in `.env` (local) or the host's secret store. `.env.exampl
 |---|:-:|---|---|
 | `NODE_ENV` | ✓ | `development` | `development` \| `test` \| `production` |
 | `PORT` | ✓ | `4000` | |
-| `MAINTENANCE_MODE` | | `off` | `on` → every non-`GET` route returns `503 MAINTENANCE` (checkout and reconcile included). Forced `on` by the restore gate until validation passes (§7) |
+| `MAINTENANCE_MODE` | | `off` | `on` → every non-`GET` route returns `503 MAINTENANCE` (checkout and reconcile included). The gate in §7 forces maintenance whenever its record is missing or invalid; this variable can only add maintenance, never remove it |
 | `MONGODB_URI` | ✓ | `mongodb://localhost:27017/?replicaSet=rs0` | **Secret** in non-local. API only. Must point to a replica set; the API refuses to start otherwise. |
 | `MONGODB_DB_NAME` | ✓ | `itps_dev` | |
 | `SESSION_SECRET` | ✓ | — | **Secret**, ≥ 32 random bytes; comma-separated for rotation |
@@ -156,29 +156,44 @@ Config is parsed with Zod at API startup; a missing or malformed required variab
 
 ## 7. Backup and recovery
 
-**What counts as a recovery point (M1-015 B2).** A backup is usable only if it reflects **one consistent moment across all collections**, because `checkoutKeys`, `orders`, `products` and `categories` must agree (DATABASE_DESIGN §7.2, §7.5). An ordinary `mongodump` of a live database does **not** give that: it reads collections one after another at different times, so an order can be in the dump while its registry record or stock decrement isn't, or the other way round. `--oplog` needs a full-instance dump and isn't relied on for Atlas tiers. So a dump is accepted only from a quiesced database with verified write draining (below).
+**What counts as a recovery point (M1-015 B2).** A backup is usable only if it reflects **one consistent moment across all collections**, because `checkoutKeys`, `orders`, `products` and `categories` must agree (DATABASE_DESIGN §7.2, §7.5). An ordinary `mongodump` of a live database does **not** give that: it reads collections one after another at different times, so an order can be in the dump while its registry record or stock decrement isn't, or the other way round. `--oplog` needs a full-instance dump and isn't relied on for Atlas tiers. So a dump is accepted only behind a verified writer barrier (below).
 
 | Atlas tier | Required method | Consistency basis |
 |---|---|---|
 | Dedicated (M10+), required for real production | **Atlas Cloud Backup** snapshots, plus continuous cloud backup for point-in-time restore; retention ≥ 7 days | Atlas-managed snapshots of the replica set, which Atlas documents as consistent. Confirm in the current Atlas docs at setup and record the result in ADR-003 |
-| Flex | Atlas-managed snapshots **if** the tier offers them at setup time and Atlas documents restore from them; otherwise the quiesced procedure | As above. Verify at setup, because tier features change |
-| Free (M0), the coursework tier | **Quiesced backup** (below), weekly and before each production deploy | No managed backups. Consistency comes from stopping all writers and proving that no write happened during the dump |
+| Flex | Atlas-managed snapshots **if** the tier offers them at setup time and Atlas documents restore from them; otherwise the fallback dump | As above. Verify at setup, because tier features change |
+| Free (M0), the coursework tier | **Fallback dump behind a writer barrier** (below), weekly and before each production deploy | No managed backups. Consistency comes from a verified barrier that removes every write privilege for the whole dump |
 
-**Quiesced backup** (`npm run ops:backup:quiesced`, run by an operator or CI job holding the backup credentials):
-1. **Stop writers.** Scale the API to zero on the hosting platform and confirm that zero instances are running. Then switch the application database user (`itps_app_<env>`) to a read-only role in Atlas, so a stray process can't write either.
-2. **Verify draining.** Run `db:fingerprint` (DATABASE_DESIGN §8) to get F1. Wait 30 s, then compute F2. **F1 must equal F2**; if not, writes are still landing, so abort the backup and investigate. The equality check is the proof; the wait is only the observation interval. A commit sent just before shutdown resolves within `maxCommitTimeMS` (5 s), well inside that interval.
-3. **Dump.** `mongodump` of the application database (gzip), encrypted at rest.
-4. **Verify after the dump.** Compute F3. **F3 must equal F1**, which proves that nothing was written during the dump. On mismatch, discard the dump and retry.
-5. **Manifest.** Store F1, per-collection counts, the tier, the time and the git SHA with the dump.
-6. **Reopen.** Restore the write role, then start the API. Checkout is unavailable for the whole procedure: a few minutes at coursework scale.
+**Writer inventory (M1-017 B2a).** Every class that can write to the application database, and how the barrier stops it:
 
-**Restore** (any tier). Checkout stays disabled until validation passes:
-1. Keep the API stopped, or run it with `MAINTENANCE_MODE=on`. In that mode every non-`GET` route, including `POST /api/orders` and `POST /api/orders/reconcile`, returns `503 MAINTENANCE`, and the API connects with the read-only user.
-2. Restore into a **new** database or cluster, never over the live one.
-3. Immediately write `systemState { _id: 'restore', status: 'pending', backupId, restoredAt }` into the restored database.
-4. Run `npm run db:verify -- --restore` (DATABASE_DESIGN §8). This checks the registry/orders invariants and the counter, type and stock invariants, and for a dump it also checks that the fingerprint equals the manifest. Only a full pass sets `status: 'validated'`.
-5. **Startup gate.** At startup the API reads `systemState.restore`. If the document exists and isn't `validated`, the API forces `MAINTENANCE_MODE=on` whatever its configuration says. So a failed or skipped validation can't reopen checkout.
-6. Point the API at the validated database, start it, run the smoke tests, then announce the restore.
+| Writer class | Credential / path | Barrier |
+|---|---|---|
+| API instances | DB user `itps_app_<env>` | API scaled to 0 (platform-confirmed) **and** the user's write role removed |
+| Background workers | None in V1. Any future worker must get its own DB user and be added to this table before it ships | Write role removed |
+| Seed (`db:seed`) and migrations (`db:migrate`) | DB user `itps_migrate_<env>` (CI/deploy job) | Write role removed; deploy pipeline locked (no deploy job may start during a backup) |
+| Maintenance jobs (`db:verify --repair`, `user:disable`, `db:reset`) | `itps_migrate_<env>` or an operator user | Write role removed; the runbook forbids running them during a backup |
+| Privileged human operators | Atlas project users (UI, Data Explorer, mongosh) | During the backup, every DB user except the backup user is read-only. Project roles that could create or alter DB users are held only by the backup operator, under a two-person rule |
+| Atlas internal TTL monitor | Server-side | Deletes only from `sessions` and `auditLogs`, which are outside the consistency scope and the fingerprint (DATABASE_DESIGN §8) |
+
+**Barrier (fallback dump, M0 and Flex without snapshots).** `npm run ops:backup:barrier`:
+1. **Establish.** Lock the deploy pipeline. Scale the API to 0 and confirm through the platform API that 0 instances are running. Through the Atlas Admin API, set every database user except the read-only backup user (`itps_backup_<env>`) to a read-only role.
+2. **Verify (the actual proof).** Read back, through the Atlas Admin API, the full list of database users and their roles. It must show **no** user with write privileges on the application database and no user missing from the inventory. Record the Atlas activity-feed position. If anything can't be read or confirmed → **abort**.
+3. **Dump** the in-scope collections with the backup user.
+4. **Verify it was maintained.** Read the users/roles list again and the activity feed since the recorded position. Any user or role change, new user, pipeline run or platform instance start during the window → **abort and discard the dump**.
+5. **Supplementary integrity.** `db:fingerprint` before and after the dump must match, and the value goes into the manifest. A mismatch aborts. A match is **not** taken as proof of quiescence; steps 2 and 4 are.
+6. **Release.** Restore the roles, unlock the pipeline, start the API.
+
+If the barrier can't be established in step 1 or 2, or isn't maintained in step 4, there is no backup for that run, and the job fails visibly.
+
+**Restore (fail-closed, M1-017 B2b).**
+- **Gate location.** Restore-control metadata lives in the `controlGate` collection. It is excluded from every backup and from the fingerprint, so a restored database **never** contains a gate record.
+- **Default closed.** At startup, and every 30 s afterwards, the API reads `controlGate { _id: 'gate' }` in the database it is configured for. It serves checkout and reconcile **only if** the record exists and parses, `status = 'open'`, `targetDb` equals its `MONGODB_DB_NAME`, `clusterId` equals its configured cluster, and `validationId` matches a validation entry in the same document. Anything else (missing, corrupt, a different target, or an unreadable record) → maintenance mode: every non-`GET` route returns `503 MAINTENANCE`. `MAINTENANCE_MODE=off` can't override a closed gate.
+- **Procedure.**
+  1. Restore into a **new** database name that no running API is configured for.
+  2. Run `db:verify --restore --restore-id <id>`. On success it writes the gate record `{ status: 'open', restoreId, backupId, targetDb, clusterId, fingerprint, validationId, validatedAt }` with write concern `majority`. On any failure it writes nothing.
+  3. Only then point the API at the database.
+- **Crash safety.** A crash anywhere before step 2 completes leaves no gate record, so the database stays closed. A gate record copied from another database fails the `targetDb`/`clusterId` match.
+- **Initial deployment.** `db:migrate` creates an `open` gate (`restoreId: 'initial'`) only on an empty database, with no documents in any in-scope collection.
 
 **Limitations of restoring an older backup** (documented, not mitigated in V1):
 - Everything after the restore point is lost: orders, stock changes, cancellations, key closures and account disablements.

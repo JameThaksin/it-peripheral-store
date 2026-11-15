@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v8 (M1-015). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v9 (M1-017). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -49,10 +49,10 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within the replay window |
 | 409 | `IDEMPOTENCY_KEY_CLOSED` | The key can't create an order, now or ever (permanent for the account's lifetime): its order's replay window has ended, or the key was closed by a failed checkout or by reconcile. `outcome: ORDER_FOUND` with `details: { orderNumber, createdAt }`, or `outcome: CONFIRMED_NOT_COMMITTED`. Both are decided by reading the key registry **and** `orders` with read concern `majority`. No new order |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
-| 403 | `ACCOUNT_DISABLED` | The account was disabled (DATABASE_DESIGN §7.7), possibly after this request was authenticated. Returned by the checkout and reconcile transactions' account fence; nothing was written. No `outcome` |
+| 403 | `ACCOUNT_DISABLED` | The account's disablement committed before this request's account-fence transaction. Every checkout and reconcile response, existing-key replays and `409`s included, requires a committed fence first (DATABASE_DESIGN §7.2 *Disablement linearization*). Nothing was written or revealed. No `outcome`. A request whose fence committed before the disablement completes normally, even if its response arrives later |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
-| 503 | `MAINTENANCE` | Writes are disabled: backup, restore or failed restore validation (DEPLOYMENT_DESIGN §7). Returned before any database work |
+| 503 | `MAINTENANCE` | Writes are disabled: backup, or the startup gate is closed (missing, corrupt or mismatched validation record after a restore, DEPLOYMENT_DESIGN §7). Returned for every non-`GET` route, checkout and reconcile included, before any database work |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked. On `POST /api/orders` it carries `outcome: UNKNOWN` |
 | 503 | `CHECKOUT_RETRY` | `outcome: UNKNOWN`. The key's outcome could not be established. It means neither "nothing was ordered" nor "an order exists". `Retry-After` header. Retry the same request with the **same** key, or call `POST /api/orders/reconcile`; never start a new key while the outcome is unknown |
 
@@ -260,7 +260,7 @@ Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EX
 | The key is durably closed (now or earlier) **and** a later majority read of `orders` finds no order | `200 { "data": { "outcome": "CONFIRMED_NOT_COMMITTED" } }` |
 | Couldn't be established (closure not acknowledged within 3 attempts / 5 s, a registry or `orders` read failed or timed out, record not yet majority-visible) | `503 CHECKOUT_RETRY`, `outcome: UNKNOWN`, `Retry-After`. Calling again is safe |
 | No session, or the session of a disabled account | `401`; nothing written |
-| Account disabled after this request was authenticated (the fence transaction's account check failed) | `403 ACCOUNT_DISABLED`; nothing written |
+| Account disabled before this request's fence committed (including a request authenticated earlier and paused) | `403 ACCOUNT_DISABLED`; nothing written, nothing revealed, even for a key that already has an order |
 | Maintenance mode | `503 MAINTENANCE`; nothing written |
 | Missing or invalid CSRF token | `403`; nothing written |
 
