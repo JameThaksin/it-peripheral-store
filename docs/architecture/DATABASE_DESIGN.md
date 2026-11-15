@@ -1,6 +1,6 @@
 # Database Design — IT Peripheral Store (MongoDB)
 
-Status: Draft v4 (M1-007). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
+Status: Draft v5 (M1-009). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
 
 ## 1. Conventions
 
@@ -257,6 +257,7 @@ Atlas Search is a future option (REQ-F06); the native text index is sufficient f
 | `status` | string | ✓ | enum `pending`,`confirmed`,`shipped`,`delivered`,`cancelled` |
 | `statusHistory` | array<{status, at, by}> | ✓ | append-only |
 | `note` | string | | ≤ 500 customer note |
+| `idempotencyKey` | string | ✓ | the checkout's idempotency key (UUID v7); kept for the order's lifetime so a key can never create a second order (R1) |
 
 `OrderItem` = `{ productId: ObjectId, sku: string, name: string, imageUrl: string, unitPriceSatang: int 1–10,000,000, quantity: int 1–10, lineTotalSatang: int }`. `productId` is unique within `items` (lines are merged before insert, BR-04).
 
@@ -268,6 +269,7 @@ Indexes:
 | `{ userId: 1, createdAt: -1 }` | "My orders" |
 | `{ status: 1, createdAt: -1 }` | Admin order queue |
 | `{ "items.productId": 1 }` | Admin report "orders containing product" |
+| `{ userId: 1, idempotencyKey: 1 }` unique | Permanent backstop: one order per key, ever (R1). Also serves the client reconciliation lookup `GET /api/orders?idempotencyKey=` |
 
 ```json
 {
@@ -295,16 +297,16 @@ Indexes:
 
 ### 4.5 Supporting: `idempotencyKeys`, `sessions`, `auditLogs`
 
-**`idempotencyKeys`** (F02, ADR-002 D2): one document per accepted checkout.
+**`idempotencyKeys`** (F02, ADR-002 D2): one document per accepted checkout, used for **payload-checked replay** during the 24 h replay window. The permanent one-order-per-key guarantee comes from the unique index on `orders` (§4.4).
 
 | Field | Type | Req | Validation |
 |---|---|:-:|---|
 | `userId` | ObjectId → users | ✓ | |
-| `key` | string | ✓ | UUID v4 from client |
+| `key` | string | ✓ | UUID v7 from client (its embedded timestamp is the key's issue time, §7.2) |
 | `fingerprint` | string | ✓ | hex SHA-256 of canonical JSON of the **normalized** request: items sorted by `productId` with merged quantities, `shippingAddress`, `note` |
 | `orderId` | ObjectId → orders | ✓ | order created by this key |
 | `createdAt` | Date | ✓ | |
-| `expiresAt` | Date | ✓ | `createdAt + 24 h` |
+| `expiresAt` | Date | ✓ | `createdAt + 24 h`, where `createdAt` is the server time of the committing transaction. This is the end of the replay window |
 
 Indexes: `{ userId: 1, key: 1 }` unique · `{ expiresAt: 1 }` TTL `expireAfterSeconds: 0`. TTL removal runs roughly once a minute, so the service treats a record with `expiresAt <= now` as absent and deletes it inside the checkout transaction before inserting the new one.
 
@@ -370,7 +372,7 @@ MongoDB transactions use snapshot isolation. Two transactions that **write the s
 | `stockAdjust: n`, n > 0 (restock) | `{ _id, stock: { $lte: 1000000 - n } }` | `{ $inc: { stock: n, inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` (would exceed admin cap) |
 | `stockAdjust: n`, n < 0 (write-off) | `{ _id, stock: { $gte: -n } }` | `{ $inc: { stock: n, inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` (would go negative) |
 | `stockSet: v, expectedRevision: r` (absolute count, 0 ≤ v ≤ 1,000,000; `r` parsed from its decimal string to `Long`) | `{ _id, inventoryRevision: r }` | `{ $set: { stock: v }, $inc: { inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` with `details.currentStock`, `details.currentRevision` |
-| Product create (API or seed insert) | — | `stock: initial (0–1,000,000), inventoryRevision: Long(0)` | — |
+| Product create (API or seed insert, §7.5 `createProduct`) | `{ sku }` with `upsert`, `$setOnInsert` only | `stock: initial (0–1,000,000), inventoryRevision: Long(0)` | Existing SKU → nothing written (`409 SKU_TAKEN` via the API; skipped by the seed) |
 
 There is no unconditional stock write and no write that changes `stock` without incrementing the revision. Relative adjustments never conflict with checkout: both are atomic `$inc`, so both changes are kept. An absolute correction succeeds only if **no** stock mutation happened since the admin loaded the product. For example: admin loads (stock 10, rev 5) → sale (7, rev 6) → restock (10, rev 7) → `stockSet` with `expectedRevision: 5` is rejected although stock is 10 again. A missing id → `404`. Each change writes an `auditLogs` entry with before/after stock and revision.
 
@@ -380,11 +382,13 @@ The request is validated and normalized before any database work (merge duplicat
 
 **Transaction body**
 
-1. `idempotencyKeys.findOne({ userId, key })`. Found and not expired → stop and go to *Replay* below with that record. Found and expired (`expiresAt <= now`) → delete it.
+1. `idempotencyKeys.findOne({ userId, key })`. Found and not expired → stop and go to *Replay* below with that record. Found and expired (`expiresAt <= now`) → delete it and continue.
+1a. **Retired-key check (R1).** `orders.findOne({ userId, idempotencyKey: key })`. Found → stop: `409 IDEMPOTENCY_KEY_EXPIRED` with `details: { orderNumber, createdAt }`. The key already produced an order whose replay window has ended, and it will never create another.
+1b. **Key age check (R1).** If the key's UUID v7 timestamp is ≥ 24 h before server time → stop: `422 IDEMPOTENCY_KEY_EXPIRED` with `details: { orderNumber: null }`. No order exists for it, and an old key can't create one. (A timestamp more than 5 min in the future is rejected earlier by validation, `400`.)
 2. Insert `idempotencyKeys { userId, key, fingerprint, orderId, expiresAt }`.
 3. Load the products; each must be `isActive: true`, else throw `PRODUCT_UNAVAILABLE`.
 4. Apply the checkout decrement of §7.1 per line. Zero matches → re-read to choose between `OUT_OF_STOCK` and `PRODUCT_UNAVAILABLE`, then throw.
-5. Compute the money (§1.1) and insert the order with the pre-generated `_id` and `orderNumber`.
+5. Compute the money (§1.1) and insert the order with the pre-generated `_id`, `orderNumber` and `idempotencyKey`. A concurrent duplicate of a retired key that got past step 1a fails here on the unique `orders {userId, idempotencyKey}` index → aborted → handled as in the table below.
 
 **Outcome states (G01).** Every checkout attempt ends in exactly one of three states, and the response follows from the state:
 
@@ -402,6 +406,8 @@ An absent idempotency record **never** moves an attempt from Unknown to Not comm
 |---|---|
 | Commit acknowledged | **Committed** → `201` |
 | Body stopped at step 1 (record already committed) | *Replay* |
+| Body stopped at step 1a or 1b | Not committed → `409`/`422 IDEMPOTENCY_KEY_EXPIRED` (definitive; nothing written) |
+| Body throws `E11000` on `orders {userId, idempotencyKey}` | Not committed: an order for this key exists → read it (majority) → `409 IDEMPOTENCY_KEY_EXPIRED` with its `orderNumber`, or *Replay* if a live key record exists |
 | Body throws a business error (`OUT_OF_STOCK`, `PRODUCT_UNAVAILABLE`, `ORDER_LIMIT_EXCEEDED`) before commit | **Not committed** → return the error. It is definitive: this attempt inserted the idempotency key in its own transaction (step 2), which is only possible while no other transaction for this `(userId, key)` is committed or in progress on the primary. A committed one gives `E11000`; an in-progress one gives `WriteConflict` |
 | Body throws `E11000` on the `idempotencyKeys` `{userId,key}` index | Another transaction committed this key → *Reconcile*, because the committed record may not yet be majority-visible |
 | Body throws `E11000` on `orders.orderNumber` | Not committed: regenerate `orderNumber` and `orderId`, then next attempt |
@@ -417,7 +423,18 @@ An absent idempotency record **never** moves an attempt from Unknown to Not comm
 
 ***Replay***: if `record.fingerprint` equals ours → load `orders` by `record.orderId` and return `200` with `Idempotent-Replay: true`. Else → `422 IDEMPOTENCY_KEY_REUSED`. A missing referenced order is impossible (key and order commit together); if it happens, return `500` and log it.
 
-**Why a later retry is safe.** A retry with the same key can only reach a business error after inserting the key in its own transaction (step 2). If the earlier transaction committed on the current primary, that insert fails with `E11000` (→ *Reconcile* → *Replay*). If it is still running, the insert gets `WriteConflict` and is retried. So a definitive business error is returned only when no earlier transaction for that key is committed or in progress on the primary. A commit acknowledged only by a deposed primary (not majority-committed) is rolled back during failover, so it can't materialize later. Commits use write concern `majority`. In every path at most one order and one set of stock decrements commit per `(userId, key)` within the 24 h retention window.
+**Exact replay and expiry guarantee (R1).** For a request with key K from user U, received at server time t:
+
+| Condition (checked in this order) | Result |
+|---|---|
+| A key record exists with `t < expiresAt` (= commit time + 24 h) | Same fingerprint → `200` replay of the original order; different → `422 IDEMPOTENCY_KEY_REUSED` |
+| An order with `(U, K)` exists (its record expired or was removed) | `409 IDEMPOTENCY_KEY_EXPIRED` with `orderNumber`. **No new order** |
+| K's UUID v7 timestamp is ≥ 24 h before t | `422 IDEMPOTENCY_KEY_EXPIRED` (no order exists). **No new order** |
+| Otherwise | Normal checkout (may create exactly one order) |
+
+So: a committed checkout is replayed for at least 24 h after its commit, and **a key can create an order only within 24 h of its own issue time**. Because the commit happens after the key is issued, the replay window always outlasts the creation window, which leaves no gap in which an expired key could create an order. TTL deletion delay doesn't matter, because records with `expiresAt <= t` are treated as expired, and the `orders` lookup still answers. Unknown-outcome semantics are unchanged: a `503 CHECKOUT_RETRY` response still means "outcome unknown", and a same-key retry inside the window replays or creates exactly once. After the window, the client must reconcile (API_CONTRACTS §3.3) instead of retrying blindly.
+
+**Why a later retry is safe.** A retry with the same key can only reach a business error after inserting the key in its own transaction (step 2). If the earlier transaction committed on the current primary, that insert fails with `E11000` (→ *Reconcile* → *Replay*). If it is still running, the insert gets `WriteConflict` and is retried. So a definitive business error is returned only when no earlier transaction for that key is committed or in progress on the primary. A commit acknowledged only by a deposed primary (not majority-committed) is rolled back during failover, so it can't materialize later. Commits use write concern `majority`. In every path at most one order and one set of stock decrements commit per `(userId, key)`, **for the key's whole lifetime** (unique index on `orders`).
 
 ### 7.3 Product and category deactivation (F06, R01, R05, N06)
 
@@ -458,21 +475,51 @@ Invariant: **every active product references an active category, and each catego
 
 | Product write | Category writes in the same transaction | Failure |
 |---|---|---|
-| Create with `isActive: true` | `updateOne({ _id: cat, isActive: true }, { $inc: { activeProductCount: 1 } })` | No match → `409 CATEGORY_UNAVAILABLE` |
-| Create with `isActive: false` | Category must exist (`findOne({ _id: cat })`), any state; no counter change | Missing → `409 CATEGORY_UNAVAILABLE` |
+| Create with `isActive: true` (`createProduct`) | `updateOne({ _id: cat, isActive: true }, { $inc: { activeProductCount: 1 } })`, only if the product was actually inserted | No match → abort (product insert rolled back), `409 CATEGORY_UNAVAILABLE` |
+| Create with `isActive: false` (`createProduct`) | Category must exist (`findOne({ _id: cat })`), any state; no counter change | Missing → abort, `409 CATEGORY_UNAVAILABLE` |
 | Reactivate (`isActive: true` on an inactive product) | Same as active create, on its current category | Category inactive → `409 CATEGORY_UNAVAILABLE` (product stays inactive) |
 | Move an **active** product to another category | `+1` conditional on the new category being active; `-1` on the old | New category inactive → `409 CATEGORY_UNAVAILABLE` |
 | Move an **inactive** product | New category must exist (any state); no counter change | Missing → `409` |
 | Deactivate / delete product | `-1` on its category if it was active | — |
 
-**Single transition rule for product writes (G03).** Product create, PATCH and DELETE all go through one function, `applyProductTransition(before, requested)`. It runs inside one transaction and derives category effects only from the **persisted before-state** and the **resulting after-state**, never from which fields the request happened to contain:
+**Product creation (R2).** Creation is a separate function from updates. It never reads a before-state:
+
+```
+createProduct(input, mode)                                   // mode: 'api' | 'seed'
+withTransaction:
+  res = products.updateOne(
+          { sku: input.sku },
+          { $setOnInsert: { _id: newId, ...input fields, stock: input.stock, inventoryRevision: Long(0),
+                            isActive: input.isActive, categoryId: input.categoryId, deletedAt: null } },
+          { upsert: true })
+  if res.upsertedCount == 0:                                 // SKU already exists: nothing was written
+      mode == 'api'  ⇒ abort, 409 SKU_TAKEN
+      mode == 'seed' ⇒ return 'skipped' (existing product untouched, no counter change)
+  if input.isActive:
+      c = categories.updateOne({ _id: input.categoryId, isActive: true }, { $inc: { activeProductCount: 1 } })
+      c.matchedCount == 0 ⇒ abort (the insert is rolled back), 409 CATEGORY_UNAVAILABLE
+  else:
+      categories.findOne({ _id: input.categoryId }) == null ⇒ abort, 409 CATEGORY_UNAVAILABLE
+  return 'created'
+errors outside the body:
+  E11000 on products.sku  (concurrent create committed first)  ⇒ api: 409 SKU_TAKEN · seed: 'skipped'
+  E11000 on products.slug                                      ⇒ api: 409 SLUG_TAKEN · seed: fail with the slug named (seed data bug)
+```
+
+Concurrency:
+- **Duplicate SKU.** Two concurrent creates with the same SKU both try to insert. The unique `sku` index and the shared write make one commit. The other either sees the committed document on retry (`upsertedCount == 0`) or gets `E11000`; both map to `409 SKU_TAKEN` (seed: skipped). The category counter is incremented only by the transaction that actually inserted.
+- **Active create vs category DELETE.** Both write the category document: the create's conditional `+1` (filter `isActive: true`) and the DELETE's conditional deactivation (filter `activeProductCount: 0`). One commits first. Either the product is created and the DELETE returns `409 CATEGORY_HAS_ACTIVE_PRODUCTS`, or the category is deactivated and the create returns `409 CATEGORY_UNAVAILABLE` with no product document left behind.
+- **Inactive create vs category DELETE.** Neither changes the counter, and inactive products may reference inactive categories, so both may succeed. The invariant still holds.
+
+**Single transition rule for product updates (G03).** Product PATCH and DELETE (not creation) go through one function, `applyProductTransition(id, requested)`. It runs inside one transaction and derives category effects only from the **persisted before-state** and the **resulting after-state**, never from which fields the request happened to contain:
 
 ```
 withTransaction:
-  before = products.findOne({ _id })                         // in-transaction snapshot read (null for create)
+  before = products.findOne({ _id: id })                     // in-transaction snapshot read
+  if before == null ⇒ abort, 404 NOT_FOUND                   // updates never create
   after  = merge(before, requested)                          // categoryId and isActive after the request
-  wasActive = before?.isActive ?? false;  willBeActive = after.isActive
-  oldCat = before?.categoryId;            newCat = after.categoryId
+  wasActive = before.isActive;            willBeActive = after.isActive
+  oldCat = before.categoryId;             newCat = after.categoryId
   if willBeActive and (not wasActive or newCat != oldCat):
       categories.updateOne({ _id: newCat, isActive: true }, { $inc: { activeProductCount: 1 } })  → 0 matched ⇒ 409 CATEGORY_UNAVAILABLE
   if not willBeActive and newCat != oldCat:
@@ -510,7 +557,7 @@ Every path that can increase a category's count writes that category document wi
 - `npm run db:migrate` → creates the collections, applies validators (`collMod`) and indexes, including the `idempotencyKeys` TTL index. It is idempotent and never modifies documents.
 - `npm run db:seed` → **insert-only** and repeatable (G02):
   - Categories: `updateOne({ slug }, { $setOnInsert: { name, slug, description, sortOrder, isActive: true, activeProductCount: 0 } }, { upsert: true })`. An existing category is never modified: not its name, activation or counter.
-  - Products: each goes through the same create path as the API (§7.5 transition, create case) inside its own transaction, as insert-if-absent by `sku`: `updateOne({ sku }, { $setOnInsert: { …all fields, stock, inventoryRevision: Long(0), isActive, categoryId } }, { upsert: true })`. **Only if the upsert actually inserted** (`upsertedCount === 1`) and the product is active does the same transaction `$inc` the category's `activeProductCount`, conditional on the category being active. An existing product's stock, revision, category, activation and every other field are never touched.
+  - Products: each goes through `createProduct(input, 'seed')` (§7.5) in its own transaction, as insert-if-absent by `sku` using `$setOnInsert` only. **Only if the upsert actually inserted** and the product is active does the same transaction `$inc` the category's `activeProductCount`, conditional on the category being active. An existing product's stock, revision, category, activation and every other field are never touched.
   - Admin user: `$setOnInsert` by email from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` (never hardcoded). An existing user is never modified, including its password and role.
   - There is no `$set` anywhere in the seed. Changing existing seeded data (e.g. a corrected price) requires a reviewed one-off migration that uses the normal service operations (§7.1 for stock).
   - **Safe on a live database**: seed writes are inserts plus conditional counter increments through the §7.5 path, so they serialize with concurrent product, category and checkout operations exactly as API writes do. Two seeds running at once are also safe: the unique `sku`/`slug`/`email` indexes let only one insert win, and the loser's upsert matches the existing document without changing it.

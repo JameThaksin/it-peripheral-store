@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v4 (M1-007). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v5 (M1-009). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -46,7 +46,9 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `CATEGORY_HAS_ACTIVE_PRODUCTS` | Category delete while active products remain |
 | 409 | `PRODUCT_CONFLICT` | Product changed concurrently and the transition couldn't be re-applied within 3 tries; reload and retry |
 | 409 | `INVENTORY_LIMIT` | Cancellation would push a product's stock past the int32 hard limit; nothing changed (order keeps its status); `details: [{productId, currentStock, quantity}]`. Recover by lowering stock, then retry (DATABASE_DESIGN §7.4) |
-| 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within 24 h |
+| 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within the replay window |
+| 409 | `IDEMPOTENCY_KEY_EXPIRED` | Key already produced an order whose 24 h replay window has ended; `details: { orderNumber, createdAt }`. No new order |
+| 422 | `IDEMPOTENCY_KEY_EXPIRED` | Key issued ≥ 24 h ago and no order exists for it; `details: { orderNumber: null }`. No new order |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
@@ -197,7 +199,7 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
   "shippingAddress": { "recipient": "A Customer", "line1": "99 Example Rd.", "district": "Pathum Wan",
                        "province": "Bangkok", "postalCode": "10330", "phone": "0800000000" },
   "note": "Please call before delivery",
-  "idempotencyKey": "6f1c6d6e-3c1e-4a8e-9b5b-0b9b3d7a2c11"
+  "idempotencyKey": "019a8f2e-7c41-7a3b-9e5d-2f6c8b1a4d90"
 }
 // 201 (new) or 200 (replay)
 { "data": { "orderNumber": "ORD-20261114-7K2M9Q", "status": "pending", "items": [ … ],
@@ -205,22 +207,29 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
             "createdAt": "2026-11-14T06:10:00Z" } }
 ```
 
-Schema (strict at every level): `items` normalized as above; `shippingAddress` (strict Address); `note` ≤ 500; `idempotencyKey` **required**, UUID v4. Price, total, status and userId fields are rejected.
+Schema (strict at every level): `items` normalized as above; `shippingAddress` (strict Address); `note` ≤ 500; `idempotencyKey` **required**, UUID v7, with an embedded timestamp no more than 5 min ahead of server time (otherwise `400`). Price, total, status and userId fields are rejected.
 
 **Idempotency (F02, BR-14, DATABASE_DESIGN §7.2)**
 
 | Situation | Result |
 |---|---|
-| New key | Order created → `201`; key stored for 24 h |
-| Same key, same normalized payload, within 24 h | Original order → `200` (header `Idempotent-Replay: true`); no stock change |
-| Same key, different payload, within 24 h | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
+| New key (issued < 24 h ago) | Order created → `201`; replayable for 24 h after commit |
+| Same key, same normalized payload, within 24 h of the commit | Original order → `200` (header `Idempotent-Replay: true`); no stock change |
+| Same key, different payload, within 24 h of the commit | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
 | Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is committed |
-| Same key after 24 h | Treated as new → `201` |
+| Same key after the replay window, order exists | `409 IDEMPOTENCY_KEY_EXPIRED { orderNumber }`; **no new order** |
+| Key issued ≥ 24 h ago, no order exists | `422 IDEMPOTENCY_KEY_EXPIRED`; **no new order** |
 | Checkout fails with a business error (stock, availability, limit) | Definitive: returned only when the attempt is known not to have committed and no other transaction for this key is committed or in progress; nothing stored; the same key may be retried |
 | Commit outcome unknown | The server reconciles for up to 3 s by re-reading the key record. Found → `201`/`200`. Still unknown → `503 CHECKOUT_RETRY`. **Never** a business error while the outcome is unknown |
 | Retry budget exhausted (conflicts) | `503 CHECKOUT_RETRY` |
 
-Clients: after `503 CHECKOUT_RETRY` or a network failure, show "checking your order", retry with the same key, and never discard the key or start a new checkout until a definitive `201`, `200`, `409` or `422` arrives.
+Clients (R1):
+1. **Key creation.** Generate a UUID v7 when the user presses "Place order", using server-adjusted time (offset taken from the `Date` header of `GET /api/auth/csrf`). Store `{ key, cartSnapshot, issuedAt }` in `localStorage` key `pendingCheckout:v1` until a definitive result arrives.
+2. **Within 23 h of `issuedAt`** (1 h safety margin): after `503 CHECKOUT_RETRY` or a network failure, show "Checking your order…" and retry automatically with the **same** key and payload. Never discard the key or start a new checkout until a definitive `201`, `200`, `409` or `422` arrives.
+3. **After 23 h, or on app start with an older pending checkout:** don't resend automatically. Reconcile with `GET /api/orders?idempotencyKey=<key>` (owner only):
+   - One order → show its confirmation and clear the pending checkout.
+   - No order → show "We couldn't confirm your earlier checkout, and no order was placed. Please review your cart." Only an explicit user action places a new order, with a **new** key.
+4. Even if a client resends an expired key, the server never creates a new order with it (`409`/`422 IDEMPOTENCY_KEY_EXPIRED`).
 
 The server-side algorithm, including duplicate-key and uncertain-commit recovery outside the aborted transaction, is in DATABASE_DESIGN §7.2.
 
@@ -228,7 +237,7 @@ Clients generate a new key for each checkout attempt the user starts, and reuse 
 
 Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`, `503 CHECKOUT_RETRY`.
 
-**GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only.
+**GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only. Optional strict query `idempotencyKey` (UUID) returns at most one of the caller's orders, for client reconciliation (R1).
 **GET `/api/orders/:orderNumber`** → the caller's own order; `404` for any order the caller doesn't own, **including for admins** (F04).
 **POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once. It is not blocked by the admin stock cap; only the int32 hard limit can block it (`409 INVENTORY_LIMIT`, nothing changed). `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
 
@@ -250,7 +259,7 @@ All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (wr
 }
 ```
 
-→ `201 { data: Product }` (includes `stock` and `inventoryRevision: "0"`). `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
+→ `201 { data: Product }` (includes `stock` and `inventoryRevision: "0"`). Creation is insert-if-absent by SKU (DATABASE_DESIGN §7.5 `createProduct`). An active product requires an active category, and an inactive one requires an existing category (any state). Nothing is written on any error. `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
 
 Admin product reads (`GET /api/admin/products`, `/:id`) and every admin product response include `stock` and `inventoryRevision`. `inventoryRevision` is a **decimal string** (it is a 64-bit integer, DATABASE_DESIGN §1.1), e.g. `"7"`; clients echo it back unchanged.
 

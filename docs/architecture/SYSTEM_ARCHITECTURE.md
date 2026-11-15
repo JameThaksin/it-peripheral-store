@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v4 (M1-007). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v5 (M1-009). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -120,7 +120,7 @@ sequenceDiagram
   E->>S: createOrder(userId, dto)
   S->>S: normalize lines (merge duplicates, then check qty 1–10), fingerprint
   S->>DB: startSession + withTransaction
-  S->>DB: find idempotencyKeys {userId, key, expiresAt > now}
+  S->>DB: find idempotencyKeys {userId, key, expiresAt > now}; else orders {userId, idempotencyKey} and key age (retired → 409/422)
   alt record exists
     S-->>E: same fingerprint → replay order (200), else 422
   else new key
