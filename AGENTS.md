@@ -25,6 +25,7 @@ These rules apply to every AI agent (Claude, Codex, Copilot, etc.) and human con
 - Enforce authentication and authorization in the API, never only in the UI. Admin operations require `role=admin` on the server.
 - Validate all input on the server with the shared Zod schemas; reject unknown fields.
 - The server computes all prices and totals; never trust client-supplied money values.
+- Every write to stock, order status, product/category activation or idempotency records must follow the concurrency policies in `docs/decisions/ADR-002-DATA_CONSISTENCY.md` and `docs/architecture/DATABASE_DESIGN.md` §7 (conditional writes in transactions; no unconditional stock overwrite; no hard delete).
 - Store money as integer satang. Store passwords only as Argon2id/bcrypt hashes.
 - Products come from the database via the API; never hardcode products in the frontend.
 - Do not deploy to production or modify other repositories.

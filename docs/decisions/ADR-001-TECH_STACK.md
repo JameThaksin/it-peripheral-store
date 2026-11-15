@@ -1,8 +1,8 @@
 # ADR-001: Technology Stack and Architecture Style
 
-- Status: **Proposed** (needs team acceptance)
-- Date: 2026-11-14
-- Task: M1-001
+- Status: **Accepted as the M2 baseline** by the project owner (M1-003, 2026-11-15); formal sign-off by all four team members pending
+- Date: 2026-11-14 (updated 2026-11-15)
+- Task: M1-001, amended by M1-003 (R06)
 
 ## Context
 
@@ -18,7 +18,9 @@ Constraints: student team, local-first development, free tiers, need for readabl
 | Frontend | React 18/19 + Vite + React Router + Bootstrap 5 (`react-bootstrap`) + TanStack Query | Bootstrap mandated |
 | Backend | Node.js 22 LTS + Express 5 | Proposed, accepted |
 | Language | **TypeScript** in all workspaces | Change from brief (unspecified) — see below |
-| Database | MongoDB Atlas; Docker single-node replica set locally | MongoDB mandated |
+| Database | MongoDB Atlas; Docker single-node replica set locally (DEPLOYMENT_DESIGN §2) | MongoDB mandated |
+| Hosting topology | **Single same-origin Node service** serving SPA + `/api` (DEPLOYMENT_DESIGN §3); provider still open | Engineering (M1-003) |
+| Consistency policies | See [ADR-002](ADR-002-DATA_CONSISTENCY.md) | Engineering (M1-003) |
 | ODM | Mongoose 8 with `strict`, `sanitizeFilter` | Proposed, accepted |
 | API style | REST + JSON, envelope `{data}` / `{error}` | Proposed, accepted |
 | Auth | `express-session` + `connect-mongo`, HttpOnly cookie, CSRF synchronizer token | Proposed, accepted |
@@ -50,13 +52,13 @@ Constraints: student team, local-first development, free tiers, need for readabl
 
 ## Consequences
 
-- Local MongoDB must run as a replica set for transactions (Docker command documented in M0/README).
+- Local MongoDB must run as a replica set for transactions (`docker-compose.yml` and steps in DEPLOYMENT_DESIGN §2).
 - `argon2` needs a native build; Windows team members may need build tools, hence bcrypt fallback.
-- Same-origin hosting is preferred (see DEPLOYMENT_DESIGN §3), which narrows hosting choices slightly.
+- Same-origin hosting is **selected** (DEPLOYMENT_DESIGN §3), which rules out split static-host + API-host setups such as GitHub Pages.
 - All new endpoints must add a Zod schema in `packages/shared` and an authorization test.
 
 ## Open items
 
-- Team acceptance of TypeScript.
-- Final hosting providers for staging/production.
+- Formal team sign-off (TypeScript confirmed as baseline by the project owner).
+- Hosting provider for staging/production (topology fixed).
 - Confirm against the original assignment PDFs (not available during M1-001).

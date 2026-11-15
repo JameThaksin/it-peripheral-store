@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v1 (M1-001). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v2 (M1-003). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -8,12 +8,12 @@ Status: Draft v1 (M1-001). Base path `/api`. JSON only. Schemas live in `package
 |---|---|
 | Content type | `application/json; charset=utf-8`. Bodies > 100 kb rejected (`413`). |
 | Auth | Session cookie `itps.sid` (HttpOnly, Secure in non-local, SameSite=Lax). See [SECURITY_MODEL.md](SECURITY_MODEL.md). |
-| CSRF | All state-changing requests (`POST/PUT/PATCH/DELETE`) require header `X-CSRF-Token` matching the session token from `GET /api/auth/csrf`. |
+| CSRF | All state-changing requests (`POST/PUT/PATCH/DELETE`), **including login and register**, require header `X-CSRF-Token` matching the token stored in the current session. Lifecycle in §3.1 and SECURITY_MODEL §3.1. |
 | Success envelope | `{ "data": <object|array>, "meta"?: {...} }` |
 | Error envelope | `{ "error": { "code": "STRING_CODE", "message": "human text", "details"?: [...], "requestId": "uuid" } }` |
-| Money | Integer satang (`priceSatang`, `totalSatang`). Clients format for display. |
+| Money | Integer satang (`priceSatang`, `totalSatang`) within the bounds of DATABASE_DESIGN §1.1. Clients format for display. |
 | IDs | 24-hex ObjectId strings; invalid → `400 INVALID_ID` |
-| Unknown fields | Rejected on write (`.strict()`) → `400 VALIDATION_ERROR` |
+| Unknown fields | **Rejected everywhere**: every body, query and params schema, and every nested object, is `.strict()`. Unknown key → `400 VALIDATION_ERROR` with `details[].path` (e.g. `items.0.unitPriceSatang`); no write happens. Nothing is stripped. Server-set fields (`role`, `userId`, prices, totals, `status`, `createdBy`, `deletedAt`, `currency`) count as unknown wherever the client is not allowed to set them. |
 | Versioning | Unversioned in v1; breaking changes require `/api/v2` |
 
 ### 1.1 Pagination, filtering, sorting
@@ -40,8 +40,12 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `EMAIL_TAKEN`, `SKU_TAKEN`, `SLUG_TAKEN` | Unique conflicts |
 | 409 | `OUT_OF_STOCK` | `details` = `[{productId, requested, available}]` |
 | 409 | `PRODUCT_UNAVAILABLE` | Inactive / deleted product in cart |
-| 409 | `INVALID_STATUS_TRANSITION` | Order status rule violated |
-| 409 | `PRODUCT_HAS_ORDERS` | Hard delete blocked (BR-10) |
+| 409 | `INVALID_STATUS_TRANSITION` | Order status rule violated, or a concurrent change won; `details.currentStatus` |
+| 409 | `STOCK_CONFLICT` | `expectedStock` stale, or the adjustment would leave stock outside 0–1,000,000; `details.currentStock` |
+| 409 | `CATEGORY_UNAVAILABLE` | Product assigned to an inactive or missing category |
+| 409 | `CATEGORY_HAS_ACTIVE_PRODUCTS` | Category delete while active products remain |
+| 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within 24 h |
+| 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked |
@@ -51,7 +55,7 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | Method | Path | Auth | Purpose | Req |
 |---|---|---|---|---|
 | GET | `/api/health` | – | Liveness + DB ping (no details) | E |
-| GET | `/api/auth/csrf` | – | Issue CSRF token | E |
+| GET | `/api/auth/csrf` | – | Create anonymous session if none; return its CSRF token | E |
 | POST | `/api/auth/register` | – | Create customer | E01 |
 | POST | `/api/auth/login` | – | Start session | B06 |
 | POST | `/api/auth/logout` | session | End session | B06 |
@@ -64,16 +68,16 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | GET | `/api/products/:slug` | – | Product detail | B03 |
 | POST | `/api/cart/quote` | – | Price a cart (server prices, stock check) — no persistence | B08 |
 | POST | `/api/orders` | customer/admin | Checkout | B08, B09 |
-| GET | `/api/orders` | customer/admin | Own orders | E02 |
-| GET | `/api/orders/:orderNumber` | owner or admin | Order detail | E02 |
-| POST | `/api/orders/:orderNumber/cancel` | owner (if `pending`) | Cancel own order | E |
+| GET | `/api/orders` | customer/admin | Caller's own orders only | E02 |
+| GET | `/api/orders/:orderNumber` | customer/admin, **owner only** | Own order detail (admins use the admin route for others) | E02 |
+| POST | `/api/orders/:orderNumber/cancel` | customer/admin, **owner only**, if `pending` | Cancel own order | E |
 | GET | `/api/admin/products` | admin | All products incl. inactive | B07 |
 | POST | `/api/admin/products` | admin | Create | B07 |
 | GET | `/api/admin/products/:id` | admin | Read | B07 |
 | PATCH | `/api/admin/products/:id` | admin | Update | B07 |
-| DELETE | `/api/admin/products/:id` | admin | Delete (soft if ordered) | B07 |
+| DELETE | `/api/admin/products/:id` | admin | Delete = deactivate (always soft) | B07 |
 | GET/POST | `/api/admin/categories` | admin | List / create | E03 |
-| PATCH/DELETE | `/api/admin/categories/:id` | admin | Update / delete (blocked if products) | E03 |
+| PATCH/DELETE | `/api/admin/categories/:id` | admin | Update / delete = deactivate (blocked while active products) | E03 |
 | GET | `/api/admin/orders` | admin | All orders, filter by status | E04 |
 | GET | `/api/admin/orders/:orderNumber` | admin | Detail | E04 |
 | PATCH | `/api/admin/orders/:orderNumber/status` | admin | Change status | E04 |
@@ -81,43 +85,64 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 
 ## 3. Contracts
 
-### 3.1 Auth
+### 3.1 Auth and CSRF lifecycle (R04)
 
-**POST `/api/auth/register`** — rate limited (5/hour/IP)
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant A as API
+  B->>A: GET /api/auth/csrf
+  A-->>B: Set-Cookie itps.sid (anonymous session) · {data:{csrfToken:T1}}
+  B->>A: POST /api/auth/login + X-CSRF-Token T1
+  A->>A: verify T1 → regenerate session → new token T2
+  A-->>B: Set-Cookie itps.sid (new id) · {data:{user, csrfToken:T2}}
+  B->>A: POST /api/orders + X-CSRF-Token T2
+  B->>A: POST /api/auth/logout + X-CSRF-Token T2
+  A-->>B: 204, session destroyed, cookie cleared
+  Note over B: next write: GET /api/auth/csrf again
+```
+
+**GET `/api/auth/csrf`** → `200 { data: { csrfToken } }`. If the request has no valid session, the API creates an anonymous session holding only `{ csrfToken }` (32 random bytes, base64url). Otherwise it returns the existing session's token. The token never changes within one session ID.
+
+**POST `/api/auth/register`**: CSRF required; rate limited (5/hour/IP)
 
 ```json
 // request
 { "email": "a@example.com", "password": "correct horse battery 9", "name": "A Customer" }
 // 201
-{ "data": { "id": "…", "email": "a@example.com", "name": "A Customer", "role": "customer" } }
+{ "data": { "user": { "id": "…", "email": "a@example.com", "name": "A Customer", "role": "customer" },
+            "csrfToken": "<new token>" } }
 ```
 
-Rules: email lowercased, ≤ 254; password 10–128 chars, rejected if in a small common-password list; `role` not accepted (strict schema). Session is started on success (session ID regenerated). `409 EMAIL_TAKEN` on duplicate.
+Rules: email lowercased, ≤ 254; password 10–128 chars, rejected if it is on a small common-password list. `role` is rejected as unknown (strict schema). On success the session is **regenerated** (new ID, new CSRF token, returned in the body; the old token stops working). `409 EMAIL_TAKEN` on duplicate.
 
-**POST `/api/auth/login`** — rate limited (10/15 min per IP+email)
+**POST `/api/auth/login`**: CSRF required; rate limited (10/15 min per IP+email)
 
 ```json
 // request
 { "email": "a@example.com", "password": "…" }
 // 200
-{ "data": { "id": "…", "email": "a@example.com", "name": "A Customer", "role": "customer" } }
+{ "data": { "user": { "id": "…", "email": "a@example.com", "name": "A Customer", "role": "customer" },
+            "csrfToken": "<new token>" } }
 ```
 
-`401 INVALID_CREDENTIALS` (generic), `423 ACCOUNT_LOCKED` after 5 consecutive failures (15 min lock). Session ID regenerated on login.
+`401 INVALID_CREDENTIALS` (generic message), `423 ACCOUNT_LOCKED` after 5 consecutive failures (15 min lock). The session is regenerated as in register.
 
-**POST `/api/auth/logout`** → `204`. Destroys server session, clears cookie.
+**POST `/api/auth/logout`**: CSRF required → `204`. Destroys the server session and clears the cookie. Any later write first needs `GET /api/auth/csrf`.
 
 **GET `/api/auth/me`** → `200 { data: User }` or `401`.
 
+Client rule: keep the CSRF token in memory only, never in `localStorage`. On `403 CSRF_INVALID`, call `GET /api/auth/csrf` once and retry the request once.
+
 ### 3.2 Catalog
 
-**GET `/api/products`**
+**GET `/api/products`** (strict query; unknown parameters → `400`)
 
 | Query | Type | Notes |
 |---|---|---|
 | `q` | string 1–100 | Text search (name, brand, tags, description) |
-| `category` | slug | Filter by `categorySlug` |
-| `minPrice`, `maxPrice` | int satang | Range |
+| `category` | slug | Resolved to a category id (active categories only); unknown slug → empty result |
+| `minPrice`, `maxPrice` | int satang 0–10,000,000 | Range |
 | `inStock` | `true` | Only `stock > 0` |
 | `sort` | `newest` \| `price_asc` \| `price_desc` \| `name_asc` \| `relevance` | `relevance` only with `q` |
 | `page`, `limit` | int | See §1.1 |
@@ -126,24 +151,27 @@ Rules: email lowercased, ≤ 254; password 10–128 chars, rejected if in a smal
 {
   "data": [
     { "id": "…", "slug": "tkl-mechanical-keyboard-red-switch", "name": "TKL Mechanical Keyboard (Red Switch)",
-      "brand": "GenericBrand", "categorySlug": "keyboards", "priceSatang": 189000, "currency": "THB",
-      "inStock": true, "image": { "url": "/images/products/kb-mech-tkl-01.webp", "alt": "TKL mechanical keyboard" } }
+      "brand": "GenericBrand", "category": { "id": "…", "slug": "keyboards", "name": "Keyboards" },
+      "priceSatang": 189000, "currency": "THB", "inStock": true,
+      "image": { "url": "/images/products/kb-mech-tkl-01.webp", "alt": "TKL mechanical keyboard" } }
   ],
   "meta": { "page": 1, "limit": 12, "total": 34, "totalPages": 3 }
 }
 ```
 
-List items expose `inStock` (bool), not exact stock. Inactive products return `404` on detail for non-admins.
+`category` is filled in from the categories collection (small and cacheable). List items expose `inStock` (bool), not the exact stock. Inactive products return `404` on the detail route for everyone (admins use `/api/admin/products/:id`).
 
-**GET `/api/products/:slug`** → full product: adds `description`, `images[]`, `specs[]`, `stock` (capped display e.g. `"stock": 25`), `category {slug,name}`.
+**GET `/api/products/:slug`** → the full product: adds `description`, `images[]`, `specs[]`, `stock`, `category {id, slug, name}`.
 
-**GET `/api/categories`** → `[{ id, name, slug, description, productCount }]`.
+**GET `/api/categories`** → `[{ id, name, slug, description, productCount }]`, where `productCount` = `activeProductCount`.
 
 ### 3.3 Cart and checkout
 
 The cart lives in the browser. Prices shown in cart and checkout always come from the server.
 
-**POST `/api/cart/quote`**
+**Line normalization (F05, BR-04)** is shared by quote and checkout. First, lines with the same `productId` are summed. Then each merged quantity must be an integer 1–10, and there can be at most 20 distinct products; violations → `400 VALIDATION_ERROR` (`details[].path = "items"`, message names the product). The response always contains merged lines. Example: `[{p1, 6}, {p1, 6}]` → `400` (merged 12); `[{p1, 4}, {p1, 4}]` → one line `{p1, 8}`.
+
+**POST `/api/cart/quote`** (CSRF required, since it is a POST; no persistence)
 
 ```json
 // request
@@ -155,7 +183,7 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
   "subtotalSatang": 378000, "shippingFeeSatang": 0, "totalSatang": 378000, "currency": "THB" } }
 ```
 
-**POST `/api/orders`** — requires session + CSRF; rate limited (20/hour/user)
+**POST `/api/orders`**: session + CSRF required; rate limited (20/hour/user)
 
 ```json
 // request
@@ -166,21 +194,36 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
   "note": "Please call before delivery",
   "idempotencyKey": "6f1c6d6e-3c1e-4a8e-9b5b-0b9b3d7a2c11"
 }
-// 201
+// 201 (new) or 200 (replay)
 { "data": { "orderNumber": "ORD-20261114-7K2M9Q", "status": "pending", "items": [ … ],
             "subtotalSatang": 378000, "shippingFeeSatang": 0, "totalSatang": 378000, "currency": "THB",
             "createdAt": "2026-11-14T06:10:00Z" } }
 ```
 
-Schema: `items` 1–20, `quantity` int 1–10, duplicates merged; **no price, total, status or userId fields accepted**. Same `idempotencyKey` within 24 h returns the original order with `200`. Errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`.
+Schema (strict at every level): `items` normalized as above; `shippingAddress` (strict Address); `note` ≤ 500; `idempotencyKey` **required**, UUID v4. Price, total, status and userId fields are rejected.
 
-**GET `/api/orders`** → own orders, newest first, paginated; summary fields only.
-**GET `/api/orders/:orderNumber`** → `404` if not owner (and not admin).
-**POST `/api/orders/:orderNumber/cancel`** → only while `pending`; restores stock in a transaction.
+**Idempotency (F02, BR-14, DATABASE_DESIGN §7.2)**
+
+| Situation | Result |
+|---|---|
+| New key | Order created → `201`; key stored for 24 h |
+| Same key, same normalized payload, within 24 h | Original order → `200` (header `Idempotent-Replay: true`); no stock change |
+| Same key, different payload, within 24 h | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
+| Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is committed |
+| Same key after 24 h | Treated as new → `201` |
+| Checkout fails (stock, validation) | Nothing stored; the same key may be retried |
+
+Clients generate a new key for each checkout attempt the user starts, and reuse it on network retries and double clicks.
+
+Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`.
+
+**GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only.
+**GET `/api/orders/:orderNumber`** → the caller's own order; `404` for any order the caller doesn't own, **including for admins** (F04).
+**POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once. `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
 
 ### 3.4 Admin
 
-All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (writes) → validate. Every write creates an `auditLogs` entry.
+All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (writes) → strict validation. Every write creates an `auditLogs` entry.
 
 **POST `/api/admin/products`**
 
@@ -196,13 +239,31 @@ All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (wr
 }
 ```
 
-→ `201 { data: Product }`. `slug` auto-generated from name if omitted. `categorySlug`, `currency`, `createdBy` are server-set (not accepted). `409 SKU_TAKEN | SLUG_TAKEN`.
+→ `201 { data: Product }`. `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
 
-**PATCH `/api/admin/products/:id`** — partial of the same schema. Stock changes via PATCH set an absolute value (admin restock); concurrent checkout uses atomic `$inc`, so admins should prefer `stockAdjust` (`{"stockAdjust": 10}` → `$inc`, result must stay ≥ 0).
+**PATCH `/api/admin/products/:id`**: partial update of the create fields **except `stock`**, plus exactly one optional stock operation (F01, DATABASE_DESIGN §7.1):
 
-**DELETE `/api/admin/products/:id`** → `204`. If the product appears in any order → sets `isActive:false` and returns `200 { data: { softDeleted: true } }`.
+| Body | Meaning | Conflict |
+|---|---|---|
+| `{ "stockAdjust": 10 }` | Atomic `+10` (negative to remove) | `409 STOCK_CONFLICT` if the result would leave 0–1,000,000 |
+| `{ "stockSet": 40, "expectedStock": 37 }` | Absolute count, only if stock is still 37 | `409 STOCK_CONFLICT { currentStock }` if it changed |
+| `{ "stock": 40 }` | Not allowed | `400 VALIDATION_ERROR` |
 
-**GET `/api/admin/orders`** — query `status`, `q` (orderNumber or customer email), `from`, `to`, paging.
+Sending both `stockAdjust` and `stockSet` → `400`. Changing `categoryId`, or `isActive: true` on an inactive product, follows DATABASE_DESIGN §7.5 (`409 CATEGORY_UNAVAILABLE`). `isActive: false` behaves like DELETE.
+
+**DELETE `/api/admin/products/:id`** (F06, R01): always a soft delete, whether or not the product has orders.
+
+| Case | Response | Resulting state |
+|---|---|---|
+| Active product | `200 { data: { id, isActive: false, deletedAt } }` | Deactivated; hidden from catalog and checkout; orders unchanged |
+| Already inactive | `200`, same body (original `deletedAt`) | Unchanged (idempotent) |
+| Unknown id | `404 NOT_FOUND` | — |
+
+**DELETE `/api/admin/categories/:id`**: deactivate if `activeProductCount = 0` → `200 { data: { id, isActive: false, deletedAt } }`. Active products remain → `409 CATEGORY_HAS_ACTIVE_PRODUCTS`. Already inactive → `200`. Unknown → `404`. Category bodies (strict): `name`, `slug`, `description`, `sortOrder`, `isActive`; `parentId` and `activeProductCount` are rejected.
+
+**GET `/api/admin/orders`**: query `status`, `q` (orderNumber or customer email), `from`, `to`, paging.
+
+**GET `/api/admin/orders/:orderNumber`** → any order (`404` if it doesn't exist).
 
 **PATCH `/api/admin/orders/:orderNumber/status`**
 
@@ -210,15 +271,17 @@ All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (wr
 { "status": "confirmed", "note": "Stock checked" }
 ```
 
-Allowed transitions (BR-07): `pending→confirmed|cancelled`, `confirmed→shipped|cancelled`, `shipped→delivered`. Otherwise `409 INVALID_STATUS_TRANSITION`. Cancellation restores stock.
+Allowed transitions (BR-07): `pending→confirmed|cancelled`, `confirmed→shipped|cancelled`, `shipped→delivered`. They are applied as a conditional write (DATABASE_DESIGN §7.4). Not allowed from the current status, or lost to a concurrent change → `409 INVALID_STATUS_TRANSITION { currentStatus }`. Cancellation restores stock exactly once.
 
-## 4. Authorization matrix (enforced in API)
+## 4. Authorization matrix (enforced in API, F04)
 
-| Route group | Guest | Customer | Admin |
+| Route | Guest | Customer | Admin |
 |---|:-:|:-:|:-:|
-| `/auth/register`, `/auth/login`, catalog, `/cart/quote` | ✓ | ✓ | ✓ |
+| `/auth/csrf`, `/auth/register`, `/auth/login`, catalog, `/cart/quote` | ✓ | ✓ | ✓ |
 | `/auth/me`, `/auth/logout`, `/users/me*` | 401 | ✓ self | ✓ self |
-| `/orders*` | 401 | ✓ own only | ✓ own (all via admin) |
-| `/admin/*` | 401 | 403 | ✓ |
+| `GET /orders`, `POST /orders` | 401 | ✓ own | ✓ own |
+| `GET /orders/:n`, `POST /orders/:n/cancel` | 401 | owner ✓ · other 404 | owner ✓ · other **404** |
+| `/admin/orders`, `/admin/orders/:n` | 401 | 403 | ✓ all |
+| other `/admin/*` | 401 | 403 | ✓ |
 
-Ownership is enforced in the repository query (`{ orderNumber, userId: session.userId }`) rather than by fetching then comparing, so a missed check cannot leak data.
+On `/api/orders/*`, ownership is part of the repository filter (`{ orderNumber, userId: session.userId }`) for every role, rather than a fetch followed by a comparison, so a missed check cannot leak data. All-order access exists only on `/api/admin/orders/*`.
