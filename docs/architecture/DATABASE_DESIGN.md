@@ -423,7 +423,7 @@ The request is validated and normalized before any database work (merge duplicat
 
 **Not** relied on: that a conflicting write waits for an open transaction (it may wait, fail with a conflict, or time out); any particular scheduling order; TTL timing (there is no TTL); and the success of any single attempt.
 
-Conclusion: M1–M5 are sufficient for **safety** (I1–I4, and I5 below). They do not guarantee **liveness**. During failover, write-concern timeouts, persistent conflicts or a transaction left open after a lost `abortTransaction` (up to 60 s), the answer can be `UNKNOWN` until the condition clears. I2 lasts only as long as the registry record exists, which is why the registry is permanent for the account's lifetime (§4.5). A database restore to an earlier point is outside the guarantee (§4.5).
+Conclusion: M1–M5 are sufficient for **safety** (I1–I5). They do not guarantee **liveness**. During failover, write-concern timeouts, persistent conflicts or a transaction left open after a lost `abortTransaction` (up to 60 s), the answer can be `UNKNOWN` until the condition clears. I2 lasts only as long as the registry record exists, which is why the registry is permanent for the account's lifetime (§4.5). A database restore to an earlier point is outside the guarantee (§4.5).
 
 ***resolveKey*** `(userId, key)`. Read-only. Both reads use the primary, read concern `majority` and `maxTimeMS: 2000`, in one causally consistent session, and run **in this order**:
 
