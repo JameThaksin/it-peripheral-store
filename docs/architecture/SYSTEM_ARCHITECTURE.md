@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v3 (M1-005). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v4 (M1-007). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -136,7 +136,7 @@ sequenceDiagram
   E-->>B: response
 ```
 
-If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no idempotency record). Concurrent requests with the same key collide on the unique `idempotencyKeys` index. `withTransaction` retries only transient errors (`WriteConflict` while the winner is uncommitted). A duplicate-key error after the winner commits, an unresolved commit result, or an exhausted retry is handled by the service **outside the aborted transaction**: it re-reads the key record and replays, rejects, retries (bounded) or returns `503 CHECKOUT_RETRY` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
+If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no idempotency record). Concurrent requests with the same key collide on the unique `idempotencyKeys` index. `withTransaction` retries only transient errors (`WriteConflict` while the winner is uncommitted). A duplicate-key error after the winner commits, an unresolved commit result, or an exhausted retry is handled by the service **outside the aborted transaction**. An unresolved commit is treated as **unknown**, never as failed: the service reconciles by re-reading the key record, then replays, rejects with `422`, or returns `503 CHECKOUT_RETRY` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
 
 ## 5. Cross-cutting concerns
 

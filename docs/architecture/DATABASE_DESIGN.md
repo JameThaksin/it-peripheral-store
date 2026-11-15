@@ -1,6 +1,6 @@
 # Database Design — IT Peripheral Store (MongoDB)
 
-Status: Draft v3 (M1-005). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
+Status: Draft v4 (M1-007). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
 
 ## 1. Conventions
 
@@ -17,13 +17,13 @@ Status: Draft v3 (M1-005). Satisfies REQ-B02, B03, B09, B12. Concurrency policie
 
 ### 1.1 Numeric types, bounds and arithmetic (R03)
 
-The Node.js driver serializes a JS `number` that is an integer within int32 range as BSON `int`, and any other number as `double`. Every bound below keeps all stored values, including sums, within int32 (max 2,147,483,647). Validators therefore require `bsonType: "int"`, so a stray double, fraction or overflow fails loudly.
+The Node.js driver serializes a JS `number` that is an integer within int32 range as BSON `int`, and any other number as `double`. Every money and stock bound below keeps stored values, including sums, within int32 (max 2,147,483,647). Their validators therefore require `bsonType: "int"`, so a stray double, fraction or overflow fails loudly. The one exception is `inventoryRevision`, a counter that is stored as BSON `long` via Mongoose `BigInt` and validated as `bsonType: "long"`.
 
 | Field | Mongoose type | Bounds | Notes |
 |---|---|---|---|
 | `products.priceSatang`, `compareAtPriceSatang` | `Number` + `validate: Number.isInteger` | 1 – 10,000,000 (฿100,000) | |
 | `products.stock` | `Number` + integer validator | Admin-set: 0 – 1,000,000 (`MAX_ADMIN_STOCK`). Stored: 0 – 2,147,483,647 | Admin operations (create, `stockAdjust` up, `stockSet`) may not raise stock above 1,000,000. Cancellation restores are exempt (§7.4), so stored stock can exceed the admin cap by up to the units in open orders |
-| `products.inventoryRevision` | `Number` + integer validator | 0 – 2,147,483,647 | +1 on every stock mutation (§7.1). Reaching the int32 limit would take over 2 billion stock changes, far beyond this project's lifetime; the validator makes an overflow fail loudly rather than wrap |
+| `products.inventoryRevision` | Mongoose `BigInt` → BSON **`long`** (int64) | 0 – 9,223,372,036,854,775,807 | +1 on every stock mutation (§7.1, G04). Always written as `long` (`$inc` with `Long(1)`, insert with `0n`), so it never shares the int32 limit with stock. Lifecycle: starts at 0 on insert, only ever increases, and is never reset or reused for the product's lifetime (the seed never touches it, §8). At 1,000 mutations per second it would take about 292 million years to exhaust. An `$inc` overflow raises a server error, which aborts the transaction like any other failed write (§7.4). Serialized in the API as a **decimal string** (e.g. `"7"`), because JSON numbers can't hold every int64 value exactly |
 | `items[].unitPriceSatang` | same | 1 – 10,000,000 | |
 | `items[].quantity` | same | 1 – 10 (after merge) | |
 | `items[].lineTotalSatang` | same | ≤ 100,000,000 | = unit × qty |
@@ -64,7 +64,7 @@ erDiagram
     ObjectId categoryId FK
     int priceSatang
     int stock
-    int inventoryRevision
+    long inventoryRevision
     bool isActive
   }
   ORDERS {
@@ -194,7 +194,7 @@ Seed categories (≥ 6): `keyboards`, `mice`, `headsets`, `monitors`, `webcams`,
 | `compareAtPriceSatang` | int | | > `priceSatang` if set |
 | `currency` | string | ✓ | const `THB` |
 | `stock` | int | ✓ | ≥ 0; admin cap 1,000,000, stored max int32 (§1.1); changed only by the operations in §7.1 |
-| `inventoryRevision` | int | ✓ | default 0; incremented by **every** stock mutation; required by absolute stock corrections (§7.1) |
+| `inventoryRevision` | long | ✓ | 0 on insert; incremented by **every** stock mutation; never reset; required by absolute stock corrections (§7.1) |
 | `images` | array<{url, alt}> | ✓ | 1–8; `url` https or `/images/` path ≤ 500; `alt` ≤ 150 |
 | `specs` | array<{key, value}> | | ≤ 30; key ≤ 50, value ≤ 200 |
 | `tags` | array<string> | | ≤ 10, each ≤ 30 |
@@ -228,7 +228,7 @@ Atlas Search is a future option (REQ-F06); the native text index is sufficient f
   "priceSatang": 189000,
   "currency": "THB",
   "stock": 25,
-  "inventoryRevision": 3,
+  "inventoryRevision": { "$numberLong": "3" },
   "images": [{ "url": "/images/products/kb-mech-tkl-01.webp", "alt": "TKL mechanical keyboard" }],
   "specs": [{ "key": "Switch", "value": "Linear Red" }, { "key": "Connection", "value": "USB-C wired" }],
   "tags": ["mechanical", "tkl"],
@@ -331,7 +331,7 @@ Applied by `database/validators/products.json` during `npm run db:migrate`. Vali
       "priceSatang": { "bsonType": "int", "minimum": 1, "maximum": 10000000 },
       "compareAtPriceSatang": { "bsonType": "int", "minimum": 1, "maximum": 10000000 },
       "stock":       { "bsonType": "int", "minimum": 0 },
-      "inventoryRevision": { "bsonType": "int", "minimum": 0 },
+      "inventoryRevision": { "bsonType": "long", "minimum": 0 },
       "currency":    { "enum": ["THB"] },
       "images":      { "bsonType": "array", "minItems": 1, "maxItems": 8 }
     }
@@ -361,16 +361,16 @@ MongoDB transactions use snapshot isolation. Two transactions that **write the s
 
 ### 7.1 Stock mutations and inventory revision (F01, N02)
 
-`products.inventoryRevision` is a monotonically increasing integer. **Every** write that changes `stock` also does `$inc: { inventoryRevision: 1 }`, so a revision observed by a client identifies one exact inventory state, even if the stock number later returns to the same value.
+`products.inventoryRevision` is a monotonically increasing 64-bit integer (§1.1). **Every** write that changes `stock` also does `$inc: { inventoryRevision: Long(1) }` (written `1` below for brevity). This includes operational scripts: the only stock writers are the operations in this table, and the seed never updates existing products (§8). So a revision observed by a client identifies one exact inventory state, even if the stock number later returns to the same value.
 
 | Operation | Filter | Update | No match → |
 |---|---|---|---|
 | Checkout decrement (§7.2) | `{ _id, isActive: true, stock: { $gte: qty } }` | `{ $inc: { stock: -qty, inventoryRevision: 1 } }` | `OUT_OF_STOCK` / `PRODUCT_UNAVAILABLE` |
-| Cancellation restore (§7.4) | `{ _id }` | `{ $inc: { stock: +qty, inventoryRevision: 1 } }` | — (product always exists) |
+| Cancellation restore (§7.4) | `{ _id, stock: { $lte: 2147483647 - qty } }` (int32 hard limit only; no admin cap) | `{ $inc: { stock: +qty, inventoryRevision: 1 } }` | Abort the cancellation, `409 INVENTORY_LIMIT` |
 | `stockAdjust: n`, n > 0 (restock) | `{ _id, stock: { $lte: 1000000 - n } }` | `{ $inc: { stock: n, inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` (would exceed admin cap) |
 | `stockAdjust: n`, n < 0 (write-off) | `{ _id, stock: { $gte: -n } }` | `{ $inc: { stock: n, inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` (would go negative) |
-| `stockSet: v, expectedRevision: r` (absolute count, 0 ≤ v ≤ 1,000,000) | `{ _id, inventoryRevision: r }` | `{ $set: { stock: v }, $inc: { inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` with `details.currentStock`, `details.currentRevision` |
-| Product create | — | `stock: initial (0–1,000,000), inventoryRevision: 0` | — |
+| `stockSet: v, expectedRevision: r` (absolute count, 0 ≤ v ≤ 1,000,000; `r` parsed from its decimal string to `Long`) | `{ _id, inventoryRevision: r }` | `{ $set: { stock: v }, $inc: { inventoryRevision: 1 } }` | `409 STOCK_CONFLICT` with `details.currentStock`, `details.currentRevision` |
+| Product create (API or seed insert) | — | `stock: initial (0–1,000,000), inventoryRevision: Long(0)` | — |
 
 There is no unconditional stock write and no write that changes `stock` without incrementing the revision. Relative adjustments never conflict with checkout: both are atomic `$inc`, so both changes are kept. An absolute correction succeeds only if **no** stock mutation happened since the admin loaded the product. For example: admin loads (stock 10, rev 5) → sale (7, rev 6) → restock (10, rev 7) → `stockSet` with `expectedRevision: 5` is rejected although stock is 10 again. A missing id → `404`. Each change writes an `auditLogs` entry with before/after stock and revision.
 
@@ -386,23 +386,38 @@ The request is validated and normalized before any database work (merge duplicat
 4. Apply the checkout decrement of §7.1 per line. Zero matches → re-read to choose between `OUT_OF_STOCK` and `PRODUCT_UNAVAILABLE`, then throw.
 5. Compute the money (§1.1) and insert the order with the pre-generated `_id` and `orderNumber`.
 
-**Outer control (outside the transaction), at most 3 attempts and a 10 s overall deadline**
+**Outcome states (G01).** Every checkout attempt ends in exactly one of three states, and the response follows from the state:
 
-| Outcome of `withTransaction` | Handling |
+| State | Meaning | Response |
+|---|---|---|
+| **Committed** | Known to have committed: the driver acknowledged the commit, or reconciliation found a record with our `orderId` | `201` new order |
+| **Not committed** | Known not to have committed: the transaction body threw **before** `commitTransaction` was sent, so the driver aborted it | Business error (`409`/`422`), or the next attempt |
+| **Unknown** | `commitTransaction` was sent and its result is unresolved: an `UnknownTransactionCommitResult` the driver couldn't resolve, or a network error or timeout after the commit was sent | *Reconcile* (below). **Never** a business error, and never a fresh attempt within this request |
+
+An absent idempotency record **never** moves an attempt from Unknown to Not committed. Absence can mean the commit hasn't been applied, isn't yet majority-visible, or failed.
+
+**Outer control (outside the transaction)**: at most 3 attempts, 10 s overall deadline (driver `timeoutMS: 10000`), `maxCommitTimeMS: 5000`
+
+| Result of an attempt | Handling |
 |---|---|
-| Commits | `201` with the new order |
+| Commit acknowledged | **Committed** → `201` |
 | Body stopped at step 1 (record already committed) | *Replay* |
-| Throws business error (`OUT_OF_STOCK`, `PRODUCT_UNAVAILABLE`, `ORDER_LIMIT_EXCEEDED`) | Return it. The transaction aborted, so no key, stock change or order exists, and the client may retry with the same key |
-| Throws `E11000` on the `idempotencyKeys` `{userId,key}` index | Another request committed this key first. **Outside the aborted transaction**, read `idempotencyKeys.findOne({userId,key})` from the primary with read concern `majority`. Found → *Replay*. Not found (the winner's record expired and was removed) → next attempt |
-| Throws `E11000` on `orders.orderNumber` | Random-suffix collision: regenerate `orderNumber` and `orderId`, then next attempt |
-| Throws `E11000` on any other index | Bug or data corruption: `500 INTERNAL_ERROR`, logged with index name; no retry |
-| Throws `WriteConflict`/`TransientTransactionError` after the driver's own retries, or the 10 s deadline passes while retrying | Next attempt if the deadline allows, else `503 CHECKOUT_RETRY` with `Retry-After: 2` |
-| **Uncertain commit**: `UnknownTransactionCommitResult` not resolved by the driver, a network error after commit was sent, or `MaxTimeMSExpired` on commit | Read `idempotencyKeys.findOne({userId,key})` with read concern `majority`. Record with **our** `orderId` → the commit happened → `201` with that order. Record with a different `orderId` → *Replay*. No record → treat as not committed → next attempt |
-| Attempts exhausted | `503 CHECKOUT_RETRY`. Retrying with the same key is always safe |
+| Body throws a business error (`OUT_OF_STOCK`, `PRODUCT_UNAVAILABLE`, `ORDER_LIMIT_EXCEEDED`) before commit | **Not committed** → return the error. It is definitive: this attempt inserted the idempotency key in its own transaction (step 2), which is only possible while no other transaction for this `(userId, key)` is committed or in progress on the primary. A committed one gives `E11000`; an in-progress one gives `WriteConflict` |
+| Body throws `E11000` on the `idempotencyKeys` `{userId,key}` index | Another transaction committed this key → *Reconcile*, because the committed record may not yet be majority-visible |
+| Body throws `E11000` on `orders.orderNumber` | Not committed: regenerate `orderNumber` and `orderId`, then next attempt |
+| Body throws `E11000` on any other index | Not committed: `500 INTERNAL_ERROR`, logged with the index name; no retry |
+| `WriteConflict`/`TransientTransactionError` still failing after the driver's own retries | Not committed: next attempt if the deadline allows, else `503 CHECKOUT_RETRY` |
+| Commit result unresolved | **Unknown**. The driver has already retried `commitTransaction` on the same session until `maxCommitTimeMS`; a retry uses the same transaction number, so it can't commit twice. → *Reconcile*; no further attempts |
+| Attempts or deadline exhausted without reaching Unknown | `503 CHECKOUT_RETRY` |
 
-***Replay***: if `record.fingerprint` equals ours → load `orders` by `record.orderId` and return `200` with `Idempotent-Replay: true`. Else → `422 IDEMPOTENCY_KEY_REUSED`. If the referenced order is missing (impossible, since key and order commit together), return `500` and log it.
+***Reconcile*** (bounded, read-only): poll `idempotencyKeys.findOne({userId,key})` on the primary with read concern `majority`, every 250 ms for up to 3 s, within the 10 s deadline.
+- Record with **our** `orderId` → **Committed** → `201` with that order.
+- Record with another `orderId` → *Replay*.
+- Still absent → `503 CHECKOUT_RETRY` with `Retry-After: 5`. The response says the outcome is unknown, never that nothing was ordered. The client must retry with the **same** key and must not create a new one. The retry then either replays the original order or, if the original never committed, creates exactly one order.
 
-A request whose concurrent twin is still uncommitted gets a `WriteConflict` (labelled transient) on step 2. `withTransaction` retries it. If the twin commits, the retry finds the record at step 1 (*Replay*) or hits `E11000` (handled above). If the twin aborts, the retry inserts the key and proceeds normally. In all paths at most one order and one set of decrements commit per `(userId, key)` within the retention window.
+***Replay***: if `record.fingerprint` equals ours → load `orders` by `record.orderId` and return `200` with `Idempotent-Replay: true`. Else → `422 IDEMPOTENCY_KEY_REUSED`. A missing referenced order is impossible (key and order commit together); if it happens, return `500` and log it.
+
+**Why a later retry is safe.** A retry with the same key can only reach a business error after inserting the key in its own transaction (step 2). If the earlier transaction committed on the current primary, that insert fails with `E11000` (→ *Reconcile* → *Replay*). If it is still running, the insert gets `WriteConflict` and is retried. So a definitive business error is returned only when no earlier transaction for that key is committed or in progress on the primary. A commit acknowledged only by a deposed primary (not majority-committed) is rolled back during failover, so it can't materialize later. Commits use write concern `majority`. In every path at most one order and one set of stock decrements commit per `(userId, key)` within the 24 h retention window.
 
 ### 7.3 Product and category deactivation (F06, R01, R05, N06)
 
@@ -423,12 +438,19 @@ withTransaction:
   if !order → re-read: missing/not owner → 404; else 409 INVALID_STATUS_TRANSITION {currentStatus}
   if target == 'cancelled':
      for item in order.items:
-        products.updateOne({ _id: item.productId }, { $inc: { stock: item.quantity, inventoryRevision: 1 } })
+        res = products.updateOne({ _id: item.productId, stock: { $lte: 2147483647 - item.quantity } },
+                                 { $inc: { stock: item.quantity, inventoryRevision: Long(1) } })
+        if res.matchedCount == 0 → abort, 409 INVENTORY_LIMIT
 ```
 
 - **At most one restoration.** Stock is restored only inside the transaction whose conditional status update matched. Two concurrent cancellations both write the order document: one commits, the other's retry no longer matches its filter and returns `409`.
 - **Valid serial orderings are allowed.** A concurrent admin confirm and admin cancel on a pending order can legitimately both succeed (`pending→confirmed→cancelled`), because cancel is allowed from `confirmed`. The acceptance tests (AC-R02b) accept every serializable outcome and assert exactly one restoration whenever the final status is `cancelled`.
-- **Inventory limits never block a valid cancellation (N04).** The restore has no stock ceiling in its filter. The admin cap (1,000,000) applies only to admin increases (§7.1), and stored stock may exceed it by the units being returned. The only hard limit is the int32 validator maximum (2,147,483,647). Reaching it would need more than 2.1 billion units outstanding across orders, which the order caps (10 units per product per order, rate limits) make unreachable in practice. If it were ever hit, the validator rejects the write, the whole transaction aborts (order stays in its prior status, no unit is lost or discarded), and the API returns `500 INVENTORY_OVERFLOW` with an error log for manual action. Restoration ignores `isActive`, so inactive products still get their units back.
+- **The admin cap never blocks a cancellation (N04).** The restore has no admin-cap condition. The admin cap (1,000,000) applies only to admin increases (§7.1), and stored stock may exceed it by the units being returned. Restoration ignores `isActive`, so inactive products still get their units back.
+- **Hard numeric limits can block a cancellation, atomically and recoverably (R02, G04).** There are two hard limits:
+  - **Stock (int32, 2,147,483,647).** The restore filter requires `stock <= 2147483647 - quantity`. No match → the transaction aborts, the order keeps its prior status, no unit is restored, discarded or double-counted, and the API returns **`409 INVENTORY_LIMIT`** with `details: [{ productId, currentStock, quantity }]`. Recovery: an admin lowers stock with a negative `stockAdjust` (e.g. after moving units elsewhere), then the cancellation is retried. Reaching this needs over 2.1 billion units on one product, which isn't expected at this project's scale, but the behavior is defined and tested (AC-R02e).
+  - **Revision (int64).** Overflow is unreachable (§1.1). If the server ever rejected the `$inc`, the transaction aborts the same way and the API returns `500 INTERNAL_ERROR` (logged). Nothing is reset and no unit is lost. Recovery is a manual data fix by an operator.
+
+  Either way the cancellation is atomic: it fully commits (status, history, every restore and revision) or changes nothing.
 
 ### 7.5 Product ↔ category coordination (R05, N06)
 
@@ -443,6 +465,37 @@ Invariant: **every active product references an active category, and each catego
 | Move an **inactive** product | New category must exist (any state); no counter change | Missing → `409` |
 | Deactivate / delete product | `-1` on its category if it was active | — |
 
+**Single transition rule for product writes (G03).** Product create, PATCH and DELETE all go through one function, `applyProductTransition(before, requested)`. It runs inside one transaction and derives category effects only from the **persisted before-state** and the **resulting after-state**, never from which fields the request happened to contain:
+
+```
+withTransaction:
+  before = products.findOne({ _id })                         // in-transaction snapshot read (null for create)
+  after  = merge(before, requested)                          // categoryId and isActive after the request
+  wasActive = before?.isActive ?? false;  willBeActive = after.isActive
+  oldCat = before?.categoryId;            newCat = after.categoryId
+  if willBeActive and (not wasActive or newCat != oldCat):
+      categories.updateOne({ _id: newCat, isActive: true }, { $inc: { activeProductCount: 1 } })  → 0 matched ⇒ 409 CATEGORY_UNAVAILABLE
+  if not willBeActive and newCat != oldCat:
+      categories.findOne({ _id: newCat })                    → missing ⇒ 409 CATEGORY_UNAVAILABLE
+  if wasActive and (not willBeActive or newCat != oldCat):
+      categories.updateOne({ _id: oldCat }, { $inc: { activeProductCount: -1 } })
+  products.updateOne({ _id, isActive: before.isActive, categoryId: before.categoryId }, { $set: after fields })
+      → 0 matched ⇒ concurrent change: throw a transient error so the transaction re-runs from the new before-state (max 3), then 409 PRODUCT_CONFLICT
+```
+
+| Before → after | Category writes |
+|---|---|
+| inactive → active, same category | +1 on category (must be active) |
+| inactive → active, moved A → B | +1 on B (must be active); none on A |
+| active → inactive, same category | −1 on category |
+| active → inactive, moved A → B | −1 on A; B must exist (any state) |
+| active → active, moved A → B | +1 on B (must be active); −1 on A |
+| active → active, same category | none |
+| inactive → inactive, moved A → B | B must exist (any state) |
+| inactive → inactive, same category | none |
+
+The per-operation table above is a special case of this rule. Combined changes (e.g. `{ categoryId: B, isActive: true }`) are therefore allowed and handled atomically. A concurrent `DELETE` of B serializes with them because both write B's document. Either the DELETE commits first (the `+1` on B then fails → `409 CATEGORY_UNAVAILABLE`, nothing changes), or it commits after (B's count is now 1, so the DELETE returns `409 CATEGORY_HAS_ACTIVE_PRODUCTS`).
+
 Every path that can increase a category's count writes that category document with the filter `isActive: true`. Category deactivation (§7.3) writes the same document with the filter `activeProductCount: 0`. Concurrent operations therefore conflict and serialize, and neither can commit against a stale view. Inactive products may reference inactive categories; they are hidden from the catalog and must pass the reactivation rule before being sold. Category slug or name changes touch only the category. `npm run db:verify` recomputes the counts and reports drift; CI runs it after the seed and integration tests.
 
 ### 7.6 Replica set and Atlas limitations
@@ -454,7 +507,13 @@ Every path that can increase a category's count writes that category document wi
 
 ## 8. Seeding and migration
 
-- `npm run db:migrate` → creates the collections, applies validators (`collMod`) and indexes, including the `idempotencyKeys` TTL index.
-- `npm run db:seed` → idempotent upsert by `sku`/`slug`: ≥ 8 categories, **≥ 30 products** spread across them (realistic generic names; no real trademarks needed), with `activeProductCount` computed from the seeded products and `inventoryRevision: 0`, plus one admin account whose email and password come from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` (never hardcoded).
-- `npm run db:verify` → checks the §7.5 invariant (`activeProductCount` and active-product/active-category references) and the BSON `int` types (`$type`).
-- A CI integration test asserts `products.countDocuments({isActive:true}) >= 30` after seeding (REQ-B02 traceability).
+- `npm run db:migrate` → creates the collections, applies validators (`collMod`) and indexes, including the `idempotencyKeys` TTL index. It is idempotent and never modifies documents.
+- `npm run db:seed` → **insert-only** and repeatable (G02):
+  - Categories: `updateOne({ slug }, { $setOnInsert: { name, slug, description, sortOrder, isActive: true, activeProductCount: 0 } }, { upsert: true })`. An existing category is never modified: not its name, activation or counter.
+  - Products: each goes through the same create path as the API (§7.5 transition, create case) inside its own transaction, as insert-if-absent by `sku`: `updateOne({ sku }, { $setOnInsert: { …all fields, stock, inventoryRevision: Long(0), isActive, categoryId } }, { upsert: true })`. **Only if the upsert actually inserted** (`upsertedCount === 1`) and the product is active does the same transaction `$inc` the category's `activeProductCount`, conditional on the category being active. An existing product's stock, revision, category, activation and every other field are never touched.
+  - Admin user: `$setOnInsert` by email from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` (never hardcoded). An existing user is never modified, including its password and role.
+  - There is no `$set` anywhere in the seed. Changing existing seeded data (e.g. a corrected price) requires a reviewed one-off migration that uses the normal service operations (§7.1 for stock).
+  - **Safe on a live database**: seed writes are inserts plus conditional counter increments through the §7.5 path, so they serialize with concurrent product, category and checkout operations exactly as API writes do. Two seeds running at once are also safe: the unique `sku`/`slug`/`email` indexes let only one insert win, and the loser's upsert matches the existing document without changing it.
+- `npm run db:verify` → read-only check of the §7.5 invariant (each `activeProductCount` equals its active-product count; no active product in an inactive category), the BSON types (`int` for money and stock, `long` for `inventoryRevision`), and `stock ≥ 0`. It exits non-zero on drift. `npm run db:verify -- --repair` fixes counter drift one category at a time, in a transaction that recomputes the count and `$set`s it on the category document. That write conflicts with any concurrent product transition touching the same category, so a repair can't commit a stale count. Repair is a maintenance command and is logged to `auditLogs`.
+- `npm run db:reset` → drops and recreates the database, then migrates and seeds. It refuses to run unless `NODE_ENV` is `development` or `test`, `MONGODB_DB_NAME` ends with `_dev` or `_test`, and `--confirm` is passed. It is never run against staging or production, or while the API is serving traffic.
+- A CI integration test asserts `products.countDocuments({isActive:true}) >= 30` after seeding (REQ-B02 traceability), and AC-G02 checks that a rerun changes nothing.

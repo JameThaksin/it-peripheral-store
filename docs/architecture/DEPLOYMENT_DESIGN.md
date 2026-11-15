@@ -1,6 +1,6 @@
 # Deployment Design — IT Peripheral Store
 
-Status: Draft v3 (M1-005). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
+Status: Draft v4 (M1-007). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
 
 ## 1. Environments
 
@@ -98,9 +98,9 @@ AC-R06a, AC-R06b and AC-N01 (SYSTEM_REQUIREMENTS §7). The M2 foundation task mu
 | Component | Requirements | Candidate providers (choice still open, any meets the topology) |
 |---|---|---|
 | App service (SPA + API) | Long-running Node 22 process, env-var secrets, HTTPS termination, health check on `/api/health`, stable egress IP preferred | Render, Railway, Fly.io, Azure App Service, a university VM |
+| Database | MongoDB 7+/8 replica set (transactions) | MongoDB Atlas (M0 for coursework; M10+ for real production) |
 
 **Provider selection (open team decision, needed before staging).** Criteria, in order: (1) runs one long-lived Node 22 service with HTTPS on a single origin; (2) supports secret env vars; (3) offers static or published egress IPs so the Atlas access list can stay narrow (SECURITY_MODEL §3.5). A provider without fixed egress IPs forces a wide Atlas access list, which is acceptable for staging only if documented in an ADR with compensating controls (strong per-environment DB user, TLS, no production data); (4) free or student tier. The choice is recorded in ADR-003 when made.
-| Database | MongoDB 7+/8 replica set (transactions) | MongoDB Atlas (M0 for coursework; M10+ for real production) |
 
 ## 4. Environment variables
 

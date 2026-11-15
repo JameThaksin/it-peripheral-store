@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v3 (M1-005). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v4 (M1-007). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -44,13 +44,14 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `STOCK_CONFLICT` | `expectedRevision` stale, or a `stockAdjust` would go below 0 or above the admin cap 1,000,000; `details.currentStock`, `details.currentRevision` |
 | 409 | `CATEGORY_UNAVAILABLE` | Product assigned to an inactive or missing category |
 | 409 | `CATEGORY_HAS_ACTIVE_PRODUCTS` | Category delete while active products remain |
+| 409 | `PRODUCT_CONFLICT` | Product changed concurrently and the transition couldn't be re-applied within 3 tries; reload and retry |
+| 409 | `INVENTORY_LIMIT` | Cancellation would push a product's stock past the int32 hard limit; nothing changed (order keeps its status); `details: [{productId, currentStock, quantity}]`. Recover by lowering stock, then retry (DATABASE_DESIGN §7.4) |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within 24 h |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
-| 500 | `INVENTORY_OVERFLOW` | Cancellation restore would exceed the int32 stock limit (practically unreachable); transaction aborted, nothing changed, logged for manual action (DATABASE_DESIGN §7.4) |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked |
-| 503 | `CHECKOUT_RETRY` | Checkout couldn't be completed within its retry budget; nothing committed for this key, or the outcome will be replayed; `Retry-After` header. Retrying with the same idempotency key is safe |
+| 503 | `CHECKOUT_RETRY` | Checkout outcome **unknown** or retry budget exhausted. Does **not** mean nothing was ordered. `Retry-After` header. Retry with the **same** idempotency key: it replays the original order if it committed, or creates exactly one order if it didn't |
 
 ## 2. Endpoint index
 
@@ -215,8 +216,11 @@ Schema (strict at every level): `items` normalized as above; `shippingAddress` (
 | Same key, different payload, within 24 h | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
 | Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is committed |
 | Same key after 24 h | Treated as new → `201` |
-| Checkout fails (stock, validation) | Nothing stored; the same key may be retried |
-| Server retry budget exhausted or commit outcome unknown | Server resolves an uncertain commit by re-reading the key record; if still unresolved → `503 CHECKOUT_RETRY`, and a retry with the same key replays or creates exactly once |
+| Checkout fails with a business error (stock, availability, limit) | Definitive: returned only when the attempt is known not to have committed and no other transaction for this key is committed or in progress; nothing stored; the same key may be retried |
+| Commit outcome unknown | The server reconciles for up to 3 s by re-reading the key record. Found → `201`/`200`. Still unknown → `503 CHECKOUT_RETRY`. **Never** a business error while the outcome is unknown |
+| Retry budget exhausted (conflicts) | `503 CHECKOUT_RETRY` |
+
+Clients: after `503 CHECKOUT_RETRY` or a network failure, show "checking your order", retry with the same key, and never discard the key or start a new checkout until a definitive `201`, `200`, `409` or `422` arrives.
 
 The server-side algorithm, including duplicate-key and uncertain-commit recovery outside the aborted transaction, is in DATABASE_DESIGN §7.2.
 
@@ -226,7 +230,7 @@ Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EX
 
 **GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only.
 **GET `/api/orders/:orderNumber`** → the caller's own order; `404` for any order the caller doesn't own, **including for admins** (F04).
-**POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once and is never blocked by the admin stock cap. `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
+**POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once. It is not blocked by the admin stock cap; only the int32 hard limit can block it (`409 INVENTORY_LIMIT`, nothing changed). `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
 
 ### 3.4 Admin
 
@@ -246,19 +250,19 @@ All `/api/admin/*` routes: `requireAuth` → `requireRole('admin')` → CSRF (wr
 }
 ```
 
-→ `201 { data: Product }` (includes `stock` and `inventoryRevision: 0`). `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
+→ `201 { data: Product }` (includes `stock` and `inventoryRevision: "0"`). `stock` is accepted **only on create** (initial stock, 0–1,000,000). `slug` is generated from the name if omitted. `currency`, `createdBy`, `deletedAt` are server-set and rejected if sent. Errors: `409 SKU_TAKEN | SLUG_TAKEN | CATEGORY_UNAVAILABLE`.
 
-Admin product reads (`GET /api/admin/products`, `/:id`) and every admin product response include `stock` and `inventoryRevision`.
+Admin product reads (`GET /api/admin/products`, `/:id`) and every admin product response include `stock` and `inventoryRevision`. `inventoryRevision` is a **decimal string** (it is a 64-bit integer, DATABASE_DESIGN §1.1), e.g. `"7"`; clients echo it back unchanged.
 
 **PATCH `/api/admin/products/:id`**: partial update of the create fields **except `stock`**, plus at most one stock operation (F01, N02, DATABASE_DESIGN §7.1). Every stock change increments `inventoryRevision`:
 
 | Body | Meaning | Conflict |
 |---|---|---|
 | `{ "stockAdjust": 10 }` | Atomic `+10` (negative to write off); never conflicts with checkout | `409 STOCK_CONFLICT` if the result would be < 0, or > 1,000,000 for an increase |
-| `{ "stockSet": 40, "expectedRevision": 7 }` | Absolute count (0–1,000,000), only if no stock mutation happened since the admin read revision 7 | `409 STOCK_CONFLICT { currentStock, currentRevision }` if the revision changed, even when the stock number matches |
+| `{ "stockSet": 40, "expectedRevision": "7" }` | Absolute count (0–1,000,000), only if no stock mutation happened since the admin read revision 7 | `409 STOCK_CONFLICT { currentStock, currentRevision }` if the revision changed, even when the stock number matches |
 | `{ "stock": 40 }` | Not allowed | `400 VALIDATION_ERROR` |
 
-Sending both `stockAdjust` and `stockSet`, or `stockSet` without `expectedRevision` → `400`. Changing `categoryId`, or `isActive: true` on an inactive product, follows DATABASE_DESIGN §7.5 (`409 CATEGORY_UNAVAILABLE`). `isActive: false` behaves like DELETE.
+Sending both `stockAdjust` and `stockSet`, or `stockSet` without `expectedRevision` → `400`. `categoryId` and `isActive` may be changed in the same request. The server applies one atomic transition computed from the stored before-state and the resulting after-state (DATABASE_DESIGN §7.5, G03); errors `409 CATEGORY_UNAVAILABLE` (target category inactive or missing) or `409 PRODUCT_CONFLICT`. `isActive: false` alone behaves like DELETE. `expectedRevision` must match `/^\d{1,19}$/`.
 
 **DELETE `/api/admin/products/:id`** (F06, R01): always a soft delete, whether or not the product has orders.
 
@@ -286,7 +290,7 @@ Sending both `stockAdjust` and `stockSet`, or `stockSet` without `expectedRevisi
 { "status": "confirmed", "note": "Stock checked" }
 ```
 
-Allowed transitions (BR-07): `pending→confirmed|cancelled`, `confirmed→shipped|cancelled`, `shipped→delivered`. They are applied as a conditional write (DATABASE_DESIGN §7.4). Not allowed from the current status, or lost to a concurrent change → `409 INVALID_STATUS_TRANSITION { currentStatus }`. Cancellation restores stock exactly once.
+Allowed transitions (BR-07): `pending→confirmed|cancelled`, `confirmed→shipped|cancelled`, `shipped→delivered`. They are applied as a conditional write (DATABASE_DESIGN §7.4). Not allowed from the current status, or lost to a concurrent change → `409 INVALID_STATUS_TRANSITION { currentStatus }`. Cancellation restores stock exactly once, or fails atomically with `409 INVENTORY_LIMIT`.
 
 ## 4. Authorization matrix (enforced in API, F04)
 
