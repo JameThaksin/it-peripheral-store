@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v5 (M1-009). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v6 (M1-011). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -120,11 +120,11 @@ sequenceDiagram
   E->>S: createOrder(userId, dto)
   S->>S: normalize lines (merge duplicates, then check qty 1–10), fingerprint
   S->>DB: startSession + withTransaction
-  S->>DB: find idempotencyKeys {userId, key, expiresAt > now}; else orders {userId, idempotencyKey} and key age (retired → 409/422)
+  S->>DB: find idempotencyKeys {userId, key} (no key-age check)
   alt record exists
-    S-->>E: same fingerprint → replay order (200), else 422
+    S-->>E: committed and now < replayUntil → replay (200) or 422; otherwise 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED)
   else new key
-    S->>DB: insert idempotencyKeys {userId, key, fingerprint, orderId}
+    S->>DB: insert idempotencyKeys {userId, key, state: committed, fingerprint, orderId, createdAt, replayUntil}
     S->>DB: find active products by ids
     S->>S: compute prices (int satang, bounded) and snapshot lines
     loop each line
@@ -136,7 +136,7 @@ sequenceDiagram
   E-->>B: response
 ```
 
-If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no idempotency record). Concurrent requests with the same key collide on the unique `idempotencyKeys` index. `withTransaction` retries only transient errors (`WriteConflict` while the winner is uncommitted). A duplicate-key error after the winner commits, an unresolved commit result, or an exhausted retry is handled by the service **outside the aborted transaction**. An unresolved commit is treated as **unknown**, never as failed: the service reconciles by re-reading the key record, then replays, rejects with `422`, or returns `503 CHECKOUT_RETRY` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
+If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no idempotency record). Before returning the error, the service **fences** the key by inserting a `closed` tombstone (write concern `majority`), so the error can carry the definitive outcome `CONFIRMED_NOT_COMMITTED`. Concurrent requests with the same key collide on the unique `idempotencyKeys` index. `withTransaction` retries only transient errors (`WriteConflict` while the winner is uncommitted). A duplicate-key error after the winner commits, an unresolved commit result, or an exhausted retry is handled by the service **outside the aborted transaction**. An unresolved commit is treated as **unknown**, never as failed: the service re-reads the key record (majority) and replays, rejects, or returns `503 CHECKOUT_RETRY` with outcome `UNKNOWN`. Only a successful tombstone write, never an empty read, proves that no order exists; clients obtain one via `POST /api/orders/reconcile` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
 
 ## 5. Cross-cutting concerns
 

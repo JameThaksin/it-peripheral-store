@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v5 (M1-009). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v6 (M1-011). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -10,7 +10,7 @@ Status: Draft v5 (M1-009). Base path `/api`. JSON only. Schemas live in `package
 | Auth | Session cookie `itps.sid` (HttpOnly, Secure in non-local, SameSite=Lax). See [SECURITY_MODEL.md](SECURITY_MODEL.md). |
 | CSRF | All state-changing requests (`POST/PUT/PATCH/DELETE`), **including login and register**, require header `X-CSRF-Token` matching the token stored in the current session. Lifecycle in §3.1 and SECURITY_MODEL §3.1. |
 | Success envelope | `{ "data": <object|array>, "meta"?: {...} }` |
-| Error envelope | `{ "error": { "code": "STRING_CODE", "message": "human text", "details"?: [...], "requestId": "uuid" } }` |
+| Error envelope | `{ "error": { "code": "STRING_CODE", "message": "human text", "details"?: [...], "outcome"?: "ORDER_FOUND" \| "CONFIRMED_NOT_COMMITTED" \| "UNKNOWN", "requestId": "uuid" } }`. `outcome` appears only on `POST /api/orders` and `POST /api/orders/reconcile` and states what is known **about the idempotency key**, not just about this request (§3.3) |
 | Money | Integer satang (`priceSatang`, `totalSatang`) within the bounds of DATABASE_DESIGN §1.1. Clients format for display. |
 | IDs | 24-hex ObjectId strings; invalid → `400 INVALID_ID` |
 | Unknown fields | **Rejected everywhere**: every body, query and params schema, and every nested object, is `.strict()`. Unknown key → `400 VALIDATION_ERROR` with `details[].path` (e.g. `items.0.unitPriceSatang`); no write happens. Nothing is stripped. Server-set fields (`role`, `userId`, prices, totals, `status`, `createdBy`, `deletedAt`, `currency`) count as unknown wherever the client is not allowed to set them. |
@@ -47,13 +47,12 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `PRODUCT_CONFLICT` | Product changed concurrently and the transition couldn't be re-applied within 3 tries; reload and retry |
 | 409 | `INVENTORY_LIMIT` | Cancellation would push a product's stock past the int32 hard limit; nothing changed (order keeps its status); `details: [{productId, currentStock, quantity}]`. Recover by lowering stock, then retry (DATABASE_DESIGN §7.4) |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within the replay window |
-| 409 | `IDEMPOTENCY_KEY_EXPIRED` | Key already produced an order whose 24 h replay window has ended; `details: { orderNumber, createdAt }`. No new order |
-| 422 | `IDEMPOTENCY_KEY_EXPIRED` | Key issued ≥ 24 h ago and no order exists for it; `details: { orderNumber: null }`. No new order |
+| 409 | `IDEMPOTENCY_KEY_CLOSED` | The key can't create an order: its order's replay window has ended, or the key was closed by a failed checkout or by reconcile. `outcome: ORDER_FOUND` with `details: { orderNumber, createdAt }`, or `outcome: CONFIRMED_NOT_COMMITTED`. No new order |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked |
-| 503 | `CHECKOUT_RETRY` | Checkout outcome **unknown** or retry budget exhausted. Does **not** mean nothing was ordered. `Retry-After` header. Retry with the **same** idempotency key: it replays the original order if it committed, or creates exactly one order if it didn't |
+| 503 | `CHECKOUT_RETRY` | `outcome: UNKNOWN`. The key's outcome could not be established. It means neither "nothing was ordered" nor "an order exists". `Retry-After` header. Retry the same request with the **same** key, or call `POST /api/orders/reconcile`; never start a new key while the outcome is unknown |
 
 ## 2. Endpoint index
 
@@ -73,6 +72,7 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | GET | `/api/products/:slug` | – | Product detail | B03 |
 | POST | `/api/cart/quote` | – | Price a cart (server prices, stock check) — no persistence | B08 |
 | POST | `/api/orders` | customer/admin | Checkout | B08, B09 |
+| POST | `/api/orders/reconcile` | customer/admin, **own keys only** | Definitive outcome for one of the caller's idempotency keys; closes the key | B08 |
 | GET | `/api/orders` | customer/admin | Caller's own orders only | E02 |
 | GET | `/api/orders/:orderNumber` | customer/admin, **owner only** | Own order detail (admins use the admin route for others) | E02 |
 | POST | `/api/orders/:orderNumber/cancel` | customer/admin, **owner only**, if `pending` | Cancel own order | E |
@@ -199,7 +199,7 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
   "shippingAddress": { "recipient": "A Customer", "line1": "99 Example Rd.", "district": "Pathum Wan",
                        "province": "Bangkok", "postalCode": "10330", "phone": "0800000000" },
   "note": "Please call before delivery",
-  "idempotencyKey": "019a8f2e-7c41-7a3b-9e5d-2f6c8b1a4d90"
+  "idempotencyKey": "3b0f6c1e-9a4d-4f2b-8c7e-5d1a2b3c4d5e"
 }
 // 201 (new) or 200 (replay)
 { "data": { "orderNumber": "ORD-20261114-7K2M9Q", "status": "pending", "items": [ … ],
@@ -207,37 +207,61 @@ The cart lives in the browser. Prices shown in cart and checkout always come fro
             "createdAt": "2026-11-14T06:10:00Z" } }
 ```
 
-Schema (strict at every level): `items` normalized as above; `shippingAddress` (strict Address); `note` ≤ 500; `idempotencyKey` **required**, UUID v7, with an embedded timestamp no more than 5 min ahead of server time (otherwise `400`). Price, total, status and userId fields are rejected.
+Schema (strict at every level): `items` normalized as above; `shippingAddress` (strict Address); `note` ≤ 500; `idempotencyKey` **required**, a UUID in canonical form (any version; random v4 recommended). The server treats it as opaque and never reads a timestamp from it (M1-011 F3). Price, total, status and userId fields are rejected.
 
-**Idempotency (F02, BR-14, DATABASE_DESIGN §7.2)**
+**Idempotency (F02, BR-14, DATABASE_DESIGN §7.2, M1-011)**
 
-| Situation | Result |
+Every checkout response tells the client what is known about the **key**:
+
+| Outcome | Responses that carry it | Client meaning |
+|---|---|---|
+| `ORDER_FOUND` | `201`, `200` replay, `409 IDEMPOTENCY_KEY_CLOSED` with `orderNumber` | An order exists for this key. Show it. The key is resolved |
+| `CONFIRMED_NOT_COMMITTED` | Business errors (`409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`), `409 IDEMPOTENCY_KEY_CLOSED` without an order | No order exists, and this key can never create one (the server wrote a tombstone first). The key is resolved |
+| `UNKNOWN` | `503 CHECKOUT_RETRY`; also any network failure or timeout seen by the client | Not resolved. Retry with the same key and payload, or reconcile |
+
+`400`, `401`, `403` and `429` are returned before any database work. They change nothing, and the key keeps whatever outcome it had before.
+
+| Situation (server time t) | Result |
 |---|---|
-| New key (issued < 24 h ago) | Order created → `201`; replayable for 24 h after commit |
-| Same key, same normalized payload, within 24 h of the commit | Original order → `200` (header `Idempotent-Replay: true`); no stock change |
-| Same key, different payload, within 24 h of the commit | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
-| Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is committed |
-| Same key after the replay window, order exists | `409 IDEMPOTENCY_KEY_EXPIRED { orderNumber }`; **no new order** |
-| Key issued ≥ 24 h ago, no order exists | `422 IDEMPOTENCY_KEY_EXPIRED`; **no new order** |
-| Checkout fails with a business error (stock, availability, limit) | Definitive: returned only when the attempt is known not to have committed and no other transaction for this key is committed or in progress; nothing stored; the same key may be retried |
-| Commit outcome unknown | The server reconciles for up to 3 s by re-reading the key record. Found → `201`/`200`. Still unknown → `503 CHECKOUT_RETRY`. **Never** a business error while the outcome is unknown |
-| Retry budget exhausted (conflicts) | `503 CHECKOUT_RETRY` |
+| Key with no record | Normal checkout → `201`. No age check of any kind |
+| Same key, same normalized payload, t < `replayUntil` | Original order → `200` (header `Idempotent-Replay: true`); no stock change |
+| Same key, different payload, t < `replayUntil` | `422 IDEMPOTENCY_KEY_REUSED`; no order, no stock change |
+| Same key, t ≥ `replayUntil` | `409 IDEMPOTENCY_KEY_CLOSED`, `ORDER_FOUND`, `orderNumber`; **no new order** |
+| Key closed by a failed checkout or by reconcile | `409 IDEMPOTENCY_KEY_CLOSED`, `CONFIRMED_NOT_COMMITTED`; **no new order** |
+| Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is majority-visible, else `503` (`UNKNOWN`) |
+| Business error (stock, availability, limit) | The server first closes the key (fence), then returns the error with `CONFIRMED_NOT_COMMITTED`. If a concurrent same-key request committed first, it returns that order instead. If the fence can't be confirmed → `503`, `UNKNOWN` |
+| Commit outcome unknown | The server re-reads the key record (majority) for up to 3 s. Found → `201`/`200`; tombstone → `409 IDEMPOTENCY_KEY_CLOSED`, `CONFIRMED_NOT_COMMITTED`; still absent → `503 CHECKOUT_RETRY`, `UNKNOWN`. Absence is **never** reported as "no order" |
+| Retry budget exhausted (conflicts) | `503 CHECKOUT_RETRY`, `UNKNOWN` |
 
-Clients (R1):
-1. **Key creation.** Generate a UUID v7 when the user presses "Place order", using server-adjusted time (offset taken from the `Date` header of `GET /api/auth/csrf`). Store `{ key, cartSnapshot, issuedAt }` in `localStorage` key `pendingCheckout:v1` until a definitive result arrives.
-2. **Within 23 h of `issuedAt`** (1 h safety margin): after `503 CHECKOUT_RETRY` or a network failure, show "Checking your order…" and retry automatically with the **same** key and payload. Never discard the key or start a new checkout until a definitive `201`, `200`, `409` or `422` arrives.
-3. **After 23 h, or on app start with an older pending checkout:** don't resend automatically. Reconcile with `GET /api/orders?idempotencyKey=<key>` (owner only):
-   - One order → show its confirmation and clear the pending checkout.
-   - No order → show "We couldn't confirm your earlier checkout, and no order was placed. Please review your cart." Only an explicit user action places a new order, with a **new** key.
-4. Even if a client resends an expired key, the server never creates a new order with it (`409`/`422 IDEMPOTENCY_KEY_EXPIRED`).
+Windows: `replayUntil` = server time recorded inside the creating transaction, before its commit, + 24 h. Key records are kept 30 days; the order keeps its key permanently, so a key never creates a second order even after its record is gone.
+
+Clients (M1-011):
+1. **Starting a checkout = explicit authorization.** A key is created only when the user presses "Place order", and only if this user has no unresolved pending checkout. Generate a random UUID. Before sending, store `{ key, request, firstSentAt, outcome: 'UNKNOWN' }` in `localStorage` under `pendingCheckout:v1:<userId>`.
+2. **Resolved** (`ORDER_FOUND` or `CONFIRMED_NOT_COMMITTED`, from any response): delete the entry, then show the order, or the error and the cart. The key is never sent again. Any further order needs a new click and a new key.
+3. **Unknown** (`503`, a network failure or a timeout): keep the entry. Show "Checking your order…", and retry automatically with the **same** key and **identical** request, with backoff (5 s, 15 s, 60 s, then every 5 min while the page is open). Automatic retries stop 24 h after `firstSentAt`. "Place order" is disabled and no new key is offered while the outcome is unknown.
+4. **Reconcile** (`POST /api/orders/reconcile`): on app start with an entry older than 24 h, when automatic retries have stopped, or when the user chooses "Stop and check". `ORDER_FOUND` → show the order and delete the entry. `CONFIRMED_NOT_COMMITTED` → show "No order was placed. Review your cart and place the order again", delete the entry, and only a new click creates a new key. `503 UNKNOWN` → keep the entry and offer "Check again".
+5. **Sessions.** The entry is keyed by `userId` and is used only while that user is signed in. If the session expires (`401`), keep the entry and ask the user to sign in. After the **same** user signs in, step 4 runs before checkout is enabled. A different user on the same browser never sees or sends it. Signing out keeps an unresolved entry, because it is the only handle on that order, and the sign-out dialog warns about it. Resolved entries are deleted at once. The entry holds the cart and shipping address but no credentials.
+
 
 The server-side algorithm, including duplicate-key and uncertain-commit recovery outside the aborted transaction, is in DATABASE_DESIGN §7.2.
 
-Clients generate a new key for each checkout attempt the user starts, and reuse it on network retries and double clicks.
+Clients generate a new key only for a checkout the user explicitly starts, after any previous key is resolved, and reuse it on network retries and double clicks.
 
-Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`, `503 CHECKOUT_RETRY`.
+Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED` (each with `outcome: CONFIRMED_NOT_COMMITTED`, because the key was fenced first), `409 IDEMPOTENCY_KEY_CLOSED`, `422 IDEMPOTENCY_KEY_REUSED`, `503 CHECKOUT_RETRY`.
 
-**GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only. Optional strict query `idempotencyKey` (UUID) returns at most one of the caller's orders, for client reconciliation (R1).
+**POST `/api/orders/reconcile`**: session + CSRF required; rate limited (60/hour/user); body strict `{ "idempotencyKey": "<uuid>" }`. It returns the **definitive** outcome for one of the caller's own keys and **closes** the key, so the key can't create an order afterwards (DATABASE_DESIGN §7.2 *Fence*). Use it only to stop and decide; to complete a purchase, retry `POST /api/orders` with the same key instead.
+
+| Result | Response |
+|---|---|
+| An order exists for `(session user, key)` | `200 { "data": { "outcome": "ORDER_FOUND", "order": OrderSummary } }` |
+| No order, and the key is now closed (tombstone majority-acknowledged, or already closed) | `200 { "data": { "outcome": "CONFIRMED_NOT_COMMITTED" } }` |
+| Couldn't be established (fence not acknowledged, record not yet majority-visible, timeout) | `503 CHECKOUT_RETRY`, `outcome: UNKNOWN`, `Retry-After`. Calling again is safe |
+| No session | `401`; nothing written |
+| Missing or invalid CSRF token | `403`; nothing written |
+
+The call is idempotent: once definitive, repeating it returns the same outcome. **Ownership:** the key is always looked up and closed under `session.userId`; there is no user parameter, and admins get no wider access. Another account's key is simply a different `(userId, key)` pair, so the caller gets `CONFIRMED_NOT_COMMITTED` for their **own** namespace and learns nothing about the other account. The other account's record and order are untouched.
+
+**GET `/api/orders`** → the caller's own orders, newest first, paginated; summary fields only. There is **no** `idempotencyKey` filter (an unknown query parameter → `400`). An empty read can't prove that a checkout didn't commit, so outcome checks go through reconcile.
 **GET `/api/orders/:orderNumber`** → the caller's own order; `404` for any order the caller doesn't own, **including for admins** (F04).
 **POST `/api/orders/:orderNumber/cancel`** (empty strict body) → owner only, only while `pending`. It is a conditional transition (DATABASE_DESIGN §7.4) that restores stock exactly once. It is not blocked by the admin stock cap; only the int32 hard limit can block it (`409 INVENTORY_LIMIT`, nothing changed). `200 { data: Order }`; already cancelled or no longer pending → `409 INVALID_STATUS_TRANSITION { currentStatus }`; not owner → `404`.
 
@@ -307,7 +331,7 @@ Allowed transitions (BR-07): `pending→confirmed|cancelled`, `confirmed→shipp
 |---|:-:|:-:|:-:|
 | `/auth/csrf`, `/auth/register`, `/auth/login`, catalog, `/cart/quote` | ✓ | ✓ | ✓ |
 | `/auth/me`, `/auth/logout`, `/users/me*` | 401 | ✓ self | ✓ self |
-| `GET /orders`, `POST /orders` | 401 | ✓ own | ✓ own |
+| `GET /orders`, `POST /orders`, `POST /orders/reconcile` | 401 | ✓ own | ✓ own |
 | `GET /orders/:n`, `POST /orders/:n/cancel` | 401 | owner ✓ · other 404 | owner ✓ · other **404** |
 | `/admin/orders`, `/admin/orders/:n` | 401 | 403 | ✓ all |
 | other `/admin/*` | 401 | 403 | ✓ |
