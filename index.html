@@ -5,84 +5,88 @@
 <link href="assets/vendor/bootstrap.min.css" rel="stylesheet">
 <link href="assets/style.css" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖥️</text></svg>">
-<meta name="description" content="IT Peripheral Store: keyboards, mice, monitors, audio and accessories.">
-<title>IT Peripheral Store</title>
+<meta name="description" content="IT Peripheral Store: a student demo storefront for computer peripherals.">
+<title>IT Peripheral Store · Upgrade Your Setup</title>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
+<nav class="navbar navbar-expand-lg navbar-dark fixed-top">
   <div class="container">
     <a class="navbar-brand fw-bold" href="index.html">🖥️ IT Peripheral Store</a>
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav" aria-controls="mainNav" aria-expanded="false" aria-label="Toggle navigation"><span class="navbar-toggler-icon"></span></button>
     <div class="collapse navbar-collapse" id="mainNav">
       <ul class="navbar-nav ms-auto">
         <li class="nav-item"><a class="nav-link active" aria-current="page" href="index.html">Home</a></li>
-        <li class="nav-item"><a class="nav-link" href="index.html#features">Features</a></li>
-        <li class="nav-item"><a class="nav-link" href="index.html#categories">Categories</a></li>
+        <li class="nav-item"><a class="nav-link" href="#features">Features</a></li>
+        <li class="nav-item"><a class="nav-link" href="#categories">Categories</a></li>
         <li class="nav-item"><a class="nav-link" href="about.html">About / Team</a></li>
-        <li class="nav-item"><a class="nav-link" href="index.html#contact">Contact</a></li>
+        <li class="nav-item"><a class="nav-link" href="#contact">Contact</a></li>
       </ul>
     </div>
   </div>
 </nav>
 <header class="hero">
-  <div class="container py-5">
-    <div class="row align-items-center g-4 py-lg-5">
-      <div class="col-lg-7">
-        <h1 class="display-4 fw-bold">Gear up your desk</h1>
-        <p class="lead my-4">IT Peripheral Store brings keyboards, mice, monitors, headsets and accessories together in one simple online shop for students and professionals.</p>
-        <div class="d-flex flex-wrap gap-2">
-          <a href="#categories" class="btn btn-warning btn-lg">Explore products</a>
-          <a href="about.html" class="btn btn-outline-light btn-lg">Meet the team</a>
+  <div class="container">
+    <div class="row align-items-center g-4 g-lg-5">
+      <div class="col-lg-6">
+        <span class="badge badge-demo mb-3">Student project · demo storefront</span>
+        <h1 class="display-3">Upgrade <span class="grad">Your Setup.</span></h1>
+        <p class="lead text-soft my-4">Keyboards, mice, headsets, monitors and more: a curated look at the peripherals that make a desk work better.</p>
+        <div class="d-flex flex-wrap gap-3">
+          <a href="#featured" class="btn btn-primary btn-lg px-4">Explore products</a>
+          <a href="about.html" class="btn btn-outline-light btn-lg px-4">Meet the team</a>
         </div>
       </div>
-      <div class="col-lg-5 text-center d-none d-lg-block" aria-hidden="true" style="font-size:6rem">⌨️🖱️🎧</div>
+      <div class="col-lg-6"><div class="hero-art">
+        <img src="assets/img/monitor.svg" alt="Monitor illustration" width="240" height="160">
+        <img src="assets/img/keyboard.svg" alt="Keyboard illustration" width="240" height="160">
+        <img src="assets/img/headset.svg" alt="Headset illustration" width="240" height="160">
+      </div></div>
     </div>
   </div>
 </header>
-
-<section class="section" id="features">
+<section class="section" id="categories">
   <div class="container">
-    <h2 class="text-center fw-bold mb-2">Why shop with us</h2>
-    <p class="text-center text-muted mb-5">What our full-stack store is designed to offer</p>
-    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-4 g-4">
-      <div class="col"><div class="card h-100 border-0 shadow-sm p-3"><div class="card-body"><div class="feature-icon mb-3">🔎</div><h3 class="h5">Search &amp; filter</h3><p class="text-muted mb-0">Find the right peripheral quickly by keyword or category.</p></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm p-3"><div class="card-body"><div class="feature-icon mb-3">📦</div><h3 class="h5">Live stock</h3><p class="text-muted mb-0">Products and stock levels come from a real database, not a static list.</p></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm p-3"><div class="card-body"><div class="feature-icon mb-3">📱</div><h3 class="h5">Works on any device</h3><p class="text-muted mb-0">A responsive Bootstrap layout for phones, tablets and desktops.</p></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm p-3"><div class="card-body"><div class="feature-icon mb-3">🔒</div><h3 class="h5">Secure by design</h3><p class="text-muted mb-0">Server-side validation and prices calculated on the server.</p></div></div></div>
+    <h2 class="fw-bold mb-1">Shop by category</h2><p class="text-soft mb-4">Pick a category to see sample products.</p>
+    <div class="row row-cols-2 row-cols-md-4 g-3"><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/keyboard.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Keyboards</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/mouse.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Mice</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/headset.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Headsets</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/monitor.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Monitors</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/webcam.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Webcams</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/ssd.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Storage</h3></div></a></div><div class="col"><a href="#featured" class="text-decoration-none"><div class="card h-100 p-3 text-center"><img src="assets/img/hub.svg" alt="" width="240" height="160" class="w-100 h-auto mb-2" loading="lazy"><h3 class="h6 fw-bold mb-0 text-light">Hubs & Adapters</h3></div></a></div></div>
+  </div>
+</section>
+<section class="section section-alt" id="featured">
+  <div class="container">
+    <div class="d-flex flex-wrap justify-content-between align-items-end gap-2 mb-4">
+      <div><h2 class="fw-bold mb-1">Featured products</h2><p class="text-soft mb-0">Sample products with sample prices, for demonstration only.</p></div>
+      <span class="badge badge-demo">Demo data</span>
+    </div>
+    <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-4 g-4"><div class="col"><div class="card h-100 p-3"><img src="assets/img/keyboard.svg" alt="TKL Mechanical Keyboard illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Keyforge (sample brand)</span><h3 class="h6 fw-bold mt-1">TKL Mechanical Keyboard</h3><div class="price">฿1,890 <span class="small text-soft fw-normal">sample price</span></div></div></div><div class="col"><div class="card h-100 p-3"><img src="assets/img/mouse.svg" alt="Pro Gaming Mouse illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Vortexa (sample brand)</span><h3 class="h6 fw-bold mt-1">Pro Gaming Mouse</h3><div class="price">฿1,790 <span class="small text-soft fw-normal">sample price</span></div></div></div><div class="col"><div class="card h-100 p-3"><img src="assets/img/headset.svg" alt="Wireless ANC Headphones illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Sonora (sample brand)</span><h3 class="h6 fw-bold mt-1">Wireless ANC Headphones</h3><div class="price">฿3,490 <span class="small text-soft fw-normal">sample price</span></div></div></div><div class="col"><div class="card h-100 p-3"><img src="assets/img/monitor.svg" alt="27" QHD Gaming Monitor illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Clearline (sample brand)</span><h3 class="h6 fw-bold mt-1">27" QHD Gaming Monitor</h3><div class="price">฿7,990 <span class="small text-soft fw-normal">sample price</span></div></div></div></div>
+  </div>
+</section>
+<section class="section" id="browse">
+  <div class="container">
+    <h2 class="fw-bold mb-1">Browse the range</h2><p class="text-soft mb-4">Swipe or scroll sideways. All items and prices are sample data.</p>
+    <div class="carousel-row" tabindex="0" aria-label="Sample product list"><div class="card h-100 p-3"><img src="assets/img/keyboard.svg" alt="TKL Mechanical Keyboard illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Keyforge (sample brand)</span><h3 class="h6 fw-bold mt-1">TKL Mechanical Keyboard</h3><div class="price">฿1,890 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/mouse.svg" alt="Pro Gaming Mouse illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Vortexa (sample brand)</span><h3 class="h6 fw-bold mt-1">Pro Gaming Mouse</h3><div class="price">฿1,790 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/headset.svg" alt="Wireless ANC Headphones illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Sonora (sample brand)</span><h3 class="h6 fw-bold mt-1">Wireless ANC Headphones</h3><div class="price">฿3,490 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/monitor.svg" alt="27" QHD Gaming Monitor illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Clearline (sample brand)</span><h3 class="h6 fw-bold mt-1">27" QHD Gaming Monitor</h3><div class="price">฿7,990 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/webcam.svg" alt="4K Streaming Webcam illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Lumina (sample brand)</span><h3 class="h6 fw-bold mt-1">4K Streaming Webcam</h3><div class="price">฿3,290 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/ssd.svg" alt="1TB Portable SSD illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Datacore (sample brand)</span><h3 class="h6 fw-bold mt-1">1TB Portable SSD</h3><div class="price">฿2,990 <span class="small text-soft fw-normal">sample price</span></div></div><div class="card h-100 p-3"><img src="assets/img/hub.svg" alt="7-in-1 USB-C Hub illustration" width="240" height="160" class="w-100 h-auto mb-3" loading="lazy"><span class="small text-soft">Linkwave (sample brand)</span><h3 class="h6 fw-bold mt-1">7-in-1 USB-C Hub</h3><div class="price">฿1,290 <span class="small text-soft fw-normal">sample price</span></div></div></div>
+  </div>
+</section>
+<section class="section section-alt" id="features">
+  <div class="container">
+    <h2 class="fw-bold text-center mb-5">Why IT Peripheral Store</h2>
+    <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-4 g-4"><div class="col"><div class="card h-100 p-4"><div class="icon mb-2" aria-hidden="true">🧭</div><h3 class="h5 fw-bold">Browse by category</h3><p class="text-soft mb-0">Keyboards, mice, headsets, monitors and more, grouped so you find gear quickly.</p></div></div><div class="col"><div class="card h-100 p-4"><div class="icon mb-2" aria-hidden="true">🔍</div><h3 class="h5 fw-bold">Clear product details</h3><p class="text-soft mb-0">Each item shows its name, brand and price in Thai baht.</p></div></div><div class="col"><div class="card h-100 p-4"><div class="icon mb-2" aria-hidden="true">📱</div><h3 class="h5 fw-bold">Works on any screen</h3><p class="text-soft mb-0">The layout adapts from phones to wide desktop monitors.</p></div></div><div class="col"><div class="card h-100 p-4"><div class="icon mb-2" aria-hidden="true">🛠️</div><h3 class="h5 fw-bold">Built by students</h3><p class="text-soft mb-0">A Full Stack Development project using Bootstrap, React, Express and MongoDB.</p></div></div></div>
+  </div>
+</section>
+<section class="section" id="brands">
+  <div class="container text-center">
+    <h2 class="fw-bold mb-1">Brands in the sample catalog</h2>
+    <p class="text-soft mb-4">These are fictional brand names used in our demo data. They are not real partners.</p>
+    <div class="d-flex flex-wrap justify-content-center gap-3"><span class="brand">Keyforge</span><span class="brand">Vortexa</span><span class="brand">Sonora</span><span class="brand">Clearline</span><span class="brand">Lumina</span><span class="brand">Datacore</span><span class="brand">Linkwave</span></div>
+  </div>
+</section>
+<section class="section pt-0" id="how">
+  <div class="container">
+    <div class="notice p-4 text-center">
+      <h2 class="h5 fw-bold">About this site</h2>
+      <p class="mb-0">This is a static landing page for a university assignment. Shopping, accounts and checkout are not active here, and no real orders are taken. The full-stack store is in development in our <a href="https://github.com/JameThaksin/it-peripheral-store" target="_blank" rel="noopener">GitHub repository</a>.</p>
     </div>
   </div>
 </section>
-
-<section class="section section-alt" id="categories">
-  <div class="container">
-    <h2 class="text-center fw-bold mb-2">Product categories</h2>
-    <p class="text-center text-muted mb-5">Everything for a productive or gaming setup</p>
-    <div class="row row-cols-2 row-cols-md-4 g-3 text-center">
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">⌨️</div><div class="fw-semibold">Keyboards</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">🖱️</div><div class="fw-semibold">Mice</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">🎧</div><div class="fw-semibold">Headsets &amp; Audio</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">🖥️</div><div class="fw-semibold">Monitors</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">📷</div><div class="fw-semibold">Webcams &amp; Mics</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">💾</div><div class="fw-semibold">Storage</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">🔌</div><div class="fw-semibold">Accessories</div></div></div></div>
-      <div class="col"><div class="card h-100 border-0 shadow-sm"><div class="card-body"><div class="fs-1">🧩</div><div class="fw-semibold">And more</div></div></div></div>
-    </div>
-  </div>
-</section>
-
-<section class="section" id="how">
-  <div class="container">
-    <h2 class="text-center fw-bold mb-5">How it works</h2>
-    <div class="row g-4 text-center">
-      <div class="col-md-4"><div class="display-6 fw-bold text-primary">1</div><h3 class="h5">Browse</h3><p class="text-muted">Search the catalog or pick a category.</p></div>
-      <div class="col-md-4"><div class="display-6 fw-bold text-primary">2</div><h3 class="h5">Compare</h3><p class="text-muted">Check prices, specifications and availability.</p></div>
-      <div class="col-md-4"><div class="display-6 fw-bold text-primary">3</div><h3 class="h5">Order</h3><p class="text-muted">Place your order online (coming in the full application).</p></div>
-    </div>
-    <div class="text-center mt-4"><a href="about.html" class="btn btn-primary btn-lg">Meet the team behind it</a></div>
-  </div>
-</section>
-
-<footer class="bg-dark text-white-50 py-4" id="contact">
+<footer class="footer py-4" id="contact">
   <div class="container d-flex flex-column flex-md-row justify-content-between align-items-center gap-3">
     <span class="small">© 2026 IT Peripheral Store · Full Stack Development assignment</span>
     <div class="social d-flex flex-wrap justify-content-center gap-3">
