@@ -1,6 +1,6 @@
 # Security Model — IT Peripheral Store
 
-Status: Draft v1 (M1-001). No real secrets appear in this or any document; values shown are placeholders.
+Status: Draft v9 (M1-017). No real secrets appear in this or any document; values shown are placeholders.
 
 ## 1. Assets and trust boundaries
 
@@ -25,18 +25,18 @@ Everything from the browser — body, query, params, headers, cookies, cart cont
 
 | # | Threat | Example | Controls | Verified by |
 |---|---|---|---|---|
-| T1 | **Broken access control** | Customer calls `/api/admin/products`; customer reads another user's order by guessing `orderNumber` | `requireRole('admin')` on the admin router (not per-route opt-in); ownership in query filter; `404` for non-owned; role never from client; frontend guards are UX only | Integration tests: guest→401, customer→403 on every admin route; IDOR test on orders |
+| T1 | **Broken access control** | Customer calls `/api/admin/products`; customer reads another user's order by guessing `orderNumber` | `requireRole('admin')` on the admin router (not per-route opt-in); `/api/orders/*` filters by `userId` for **every** role, all-order access only on `/api/admin/orders/*` (API_CONTRACTS §4); `POST /api/orders/reconcile` looks up and closes keys only under `session.userId`, so another account's key reveals nothing (AC-M10-F2c); disabled accounts: the guarantee is the account fence. Every checkout or reconcile response, existing-key replays included, needs a fence transaction that commits before the disablement; otherwise `403`. `requireAuth`'s status check is only an early filter and does not by itself close the race. Read-only order endpoints rely on `requireAuth` alone (BR-18, AC-M14-B1a–d, AC-M16-B1a–b); `404` for non-owned; role never from client; frontend guards are UX only | Integration tests: guest→401, customer→403 on every admin route; AC-F04 matrix on both order routes |
 | T2 | **Authentication attacks** | Credential stuffing, brute force, session fixation | Argon2id hashing; rate limit login (10/15 min per IP+email) and register; account lock after 5 failures for 15 min; generic error message; session ID regenerated on login and privilege change; absolute session lifetime 7 days, idle 2 h | Tests for lockout, regenerate, generic error |
 | T3 | **NoSQL injection** | `{"email":{"$ne":null}}` on login; `?category[$gt]=` | Zod parses to primitives (strings/numbers only) before queries; `express-mongo-sanitize`-style rejection of keys starting with `$` or containing `.`; Mongoose `sanitizeFilter: true`; never use `$where`/`$function`; text search via `$text` with string arg | Integration tests with operator payloads on login, list filters, admin PATCH |
 | T4 | **XSS** | Admin pastes `<script>` in product description; malicious image URL `javascript:` | React escapes by default; **ban `dangerouslySetInnerHTML`** (ESLint rule); descriptions are plain text; image URL schema allows only `https:` or `/images/`; Helmet CSP: `default-src 'self'; img-src 'self' https: data:; script-src 'self'; object-src 'none'; frame-ancestors 'none'` | Lint rule; unit test URL schema; CSP header test |
-| T5 | **CSRF** | Malicious site posts to `/api/orders` using victim's cookie | `SameSite=Lax` cookie + synchronizer token (`X-CSRF-Token` from `/api/auth/csrf`, stored in session) checked on all non-GET; GET routes never change state; strict CORS allowlist with credentials | Test: write without token → 403 |
+| T5 | **CSRF** | Malicious site posts to `/api/orders` using victim's cookie | `SameSite=Lax` cookie + synchronizer token bound to the session and rotated on session regeneration (§3.1); checked on all non-GET including login/register (prevents login CSRF); timing-safe compare; GET routes never change state; same-origin topology so no CORS needed | AC-R04 lifecycle test; write without/with stale token → 403 |
 | T6 | **Sensitive data exposure** | Password hash in API response; MongoDB URI in frontend bundle; stack trace in error | `passwordHash` `select:false` + response DTO mapping (allowlist of fields); MongoDB URI only in API env; no `VITE_` prefix on secrets (only `VITE_` vars reach the bundle); error handler hides stack in non-local; pino redaction; HTTPS + HSTS | Tests: `/auth/me` has no hash; CI greps built `dist/` for `mongodb+srv`; secret scan |
 | T7 | **Missing rate limiting / abuse** | Scraping, order spam, password spraying | `express-rate-limit` with MongoDB store: global 300 req/15 min/IP; auth limits above; orders 20/h/user; body size 100 kb | Test: N+1 request → 429 |
-| T8 | **Mass assignment** | Register with `"role":"admin"`; PATCH product with `createdBy`; PATCH `/users/me` with `role` | Zod `.strict()` schemas per endpoint; services build documents from explicit fields only; never `Model.create(req.body)` | Tests with extra fields → 400 |
-| T9 | **Order price manipulation** | Client sends `"priceSatang":1` or edits `localStorage` cart | Order schema contains no money fields; server loads current price from DB, computes all totals in integer satang; quantity bounds; cart quote endpoint is informational only | Test: price fields → 400; total matches DB price |
-| T10 | **Inventory race conditions** | Two customers buy the last unit concurrently | Atomic conditional `$inc` with `stock >= qty` inside a transaction; `$jsonSchema minimum: 0`; idempotency key against double submit; cancel restores stock in same transaction | Concurrency integration test: 10 parallel orders for stock 3 → exactly 3 succeed, stock = 0 |
+| T8 | **Mass assignment** | Register with `"role":"admin"`; PATCH product with `createdBy`; PATCH `/users/me` with `role` | Zod `.strict()` on **every** object schema, nested included (body, query, params); unknown keys rejected, never stripped; Mongoose `strict: 'throw'`; services build documents from explicit fields only; never `Model.create(req.body)` | AC-F03a/b: top-level and nested extra fields → 400, no write |
+| T9 | **Order price manipulation** | Client sends `"priceSatang":1` or edits `localStorage` cart | Order schema contains no money fields; server loads current price from DB, computes all totals in bounded int32 satang with safe-integer checks (DATABASE_DESIGN §1.1); quantity bounds applied **after** merging duplicate lines (BR-04); cart quote endpoint is informational only | Test: price fields → 400; total matches DB price; AC-F05; AC-R03 |
+| T10 | **Inventory race conditions** | Two customers buy the last unit; stale admin stock value overwrites sales; double submit; double cancel; delete during checkout | All write paths in DATABASE_DESIGN §7: conditional `$inc` in transactions; every stock mutation increments `inventoryRevision`; admin stock relative or `expectedRevision`-preconditioned; idempotency records with fingerprint; conditional status transitions restore stock once; soft delete only; `$jsonSchema minimum: 0` | 10 parallel orders for stock 3 → exactly 3 succeed, stock = 0; AC-F01a–d, AC-F02a–e, AC-M10-F1a–e, AC-M10-F2a–e, AC-M10-F3a–e, AC-M12-N1a–c, AC-M12-N2a–d, AC-M12-N3a–d, AC-M14-B1a–d, AC-M16-B1a–b, AC-R2a–c, AC-G01a/b, AC-G02a/b, AC-G03a/b, AC-G04, AC-R01, AC-R02a–e, AC-R05a/c |
 
-Additional: clickjacking (`frame-ancestors 'none'`), dependency vulnerabilities (`npm audit --audit-level=high` in CI, Dependabot), open redirect (post-login redirect accepts only relative paths).
+Additional: local development database exposure (unauthenticated MongoDB published on all interfaces) is prevented by loopback-only port publishing (DEPLOYMENT_DESIGN §2.2, AC-N01); clickjacking (`frame-ancestors 'none'`), dependency vulnerabilities (`npm audit --audit-level=high` in CI, Dependabot), open redirect (post-login redirect accepts only relative paths).
 
 ## 3. Control details
 
@@ -46,7 +46,21 @@ Additional: clickjacking (`frame-ancestors 'none'`), dependency vulnerabilities 
 - Cookie `itps.sid`: `HttpOnly`, `Secure` (all non-local envs), `SameSite=Lax`, `Path=/`, no `Domain` attribute (host-only). `__Host-` prefix in production when same-origin.
 - `SESSION_SECRET` ≥ 32 random bytes; supports an array for rotation.
 - `app.set('trust proxy', 1)` behind the hosting proxy so `Secure` cookies and rate-limit IPs work.
-- Session stores only `{ userId, role, csrfToken, createdAt }`. Role is re-read from DB on each request (or on a short cache) so demotion/deactivation takes effect immediately.
+- Session stores only `{ csrfToken }` (anonymous) or `{ userId, role, csrfToken, createdAt }` (authenticated). Role is re-read from DB on each request so demotion/deactivation takes effect immediately.
+- `saveUninitialized: false`: a session is created only by `GET /api/auth/csrf`, login or register, never by browsing.
+
+**CSRF token lifecycle (R04)**
+
+| Event | Session | CSRF token |
+|---|---|---|
+| `GET /api/auth/csrf`, no session | Create anonymous session (idle 2 h) | New random 32-byte token, returned |
+| `GET /api/auth/csrf`, session exists | Unchanged | Existing token returned |
+| Register / login success | `req.session.regenerate()` (new ID, old ID destroyed) | New token generated, returned in response body |
+| Login failure | Unchanged | Unchanged |
+| Logout | `req.session.destroy()`, cookie cleared | Gone; client must call `/auth/csrf` before next write |
+| Session expiry (idle 2 h / absolute 7 d) | Removed by TTL | Next write → `403 CSRF_INVALID` (anonymous) or `401` (auth route); client re-fetches |
+
+Comparison uses `crypto.timingSafeEqual`. Tokens are never put in cookies readable by JS, URLs or logs. The selected topology is same-origin (DEPLOYMENT_DESIGN §3), so `SameSite=Lax` applies. If a cross-origin deployment is ever chosen, it needs an ADR, `SameSite=None; Secure`, and an exact-match CORS allowlist.
 
 ### 3.2 Password hashing
 

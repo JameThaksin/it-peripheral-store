@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v1 (M1-001). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md)
+Status: Draft v9 (M1-017). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -26,7 +26,7 @@ flowchart LR
 Key properties:
 
 - The browser talks only to `/api/*`. No MongoDB driver, URI or credentials exist in `apps/web` (REQ-B10, NFR-03).
-- Same-origin in production (SPA and API behind one domain, API under `/api`) keeps cookies `SameSite=Lax` and avoids CORS complexity. Separate origins are supported via a CORS allowlist (see Deployment).
+- **Same-origin is the selected topology** (ADR-001): in staging/production one Node service serves the built SPA and `/api`, so cookies stay `SameSite=Lax` and CORS is not needed. Locally, the Vite dev server proxies `/api`, which is also same-origin from the browser's view.
 - No microservices, message queues or caches in v1. One process scales vertically; it can be run as 2+ stateless instances because sessions live in MongoDB.
 
 ## 2. Monorepo layout
@@ -47,6 +47,7 @@ it-peripheral-store/
 ├── tests/
 │   ├── integration/         # API + in-memory/ephemeral MongoDB
 │   └── e2e/                 # Playwright: browse, checkout, admin CRUD
+├── docker-compose.yml       # local MongoDB single-node replica set (DEPLOYMENT_DESIGN §2)
 ├── docs/
 ├── .env.example
 └── .github/workflows/ci.yml
@@ -114,31 +115,39 @@ sequenceDiagram
   participant E as Express
   participant S as OrderService
   participant DB as MongoDB
-  B->>E: POST /api/orders {items, shippingAddress} + cookie + X-CSRF-Token
-  E->>E: helmet, rate-limit, session, csrf, requireAuth, validate(CreateOrder)
+  B->>E: POST /api/orders {items, shippingAddress, idempotencyKey} + cookie + X-CSRF-Token
+  E->>E: helmet, rate-limit, session, csrf, requireAuth, validate(CreateOrder, strict)
   E->>S: createOrder(userId, dto)
-  S->>DB: startSession + withTransaction
-  S->>DB: find active products by ids
-  S->>S: compute prices (satang) and snapshot lines
-  loop each line
-    S->>DB: updateOne({_id, stock ≥ qty}, {$inc: {stock: -qty}})
+  S->>S: normalize lines (merge duplicates, then check qty 1–10), fingerprint
+  S->>DB: authorizedResolve: txn {users fence (isActive) ; read checkoutKeys, then orders} commit majority (0 → 403; no key-age check)
+  alt order or closed record found
+    S-->>E: replay (200) / 422 within replayUntil; else 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED); read failure → 503 UNKNOWN
+  else nothing found
+    S->>DB: startSession + transaction (own bounded loop: 3 attempts, 10 s)
+    S->>DB: users.updateOne({_id, isActive: true}, {$inc: {accountFence: 1}}) (0 → 403 ACCOUNT_DISABLED)
+    S->>DB: insert checkoutKeys {userId, key, state: committed, fingerprint, orderId, createdAt, replayUntil}
+    S->>DB: find active products by ids
+    S->>S: compute prices (int satang, bounded) and snapshot lines
+    loop each line
+      S->>DB: updateOne({_id, isActive: true, stock ≥ qty}, {$inc: {stock: -qty, inventoryRevision: 1}})
+    end
+    S->>DB: insert order
+    S-->>E: order (201)
   end
-  S->>DB: insert order
-  S-->>E: order
-  E-->>B: 201 {data: order}
+  E-->>B: response
 ```
 
-If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` and the transaction aborts (no partial decrement).
+If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no registry record). Before returning the error, the service **fences** the key by inserting a `closed` record into the permanent `checkoutKeys` registry (write concern `majority`) and then checks `orders`, so the error can carry the definitive outcome `CONFIRMED_NOT_COMMITTED`. Concurrent requests with the same key collide on the unique `checkoutKeys` index; the service does not assume a conflicting operation waits. `WriteConflict`, duplicate-key errors, timeouts and unresolved commits are handled **outside the aborted transaction** with bounded retries. An unresolved commit is treated as **unknown**, never as failed. Definitive answers come only from `resolveKey`, a majority read of the registry followed by a majority read of `orders`. Any failure there gives `503 CHECKOUT_RETRY` with outcome `UNKNOWN`. A closed marker alone, or an empty read, never proves that no order exists. Clients obtain a definitive outcome via `POST /api/orders/reconcile` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
 
 ## 5. Cross-cutting concerns
 
 | Concern | Approach |
 |---|---|
-| Validation | Zod schemas in `packages/shared`; `validate()` middleware parses `body`/`query`/`params` and replaces them with parsed output (strips unknown keys) |
+| Validation | Zod schemas in `packages/shared`, **all object schemas `.strict()` including nested objects and query/params**; `validate()` middleware parses `body`/`query`/`params`, **rejects unknown keys with `400 VALIDATION_ERROR`** (never strips), and replaces the input with the parsed output. Mongoose models use `strict: 'throw'` as a backstop. (ADR-002 D3) |
 | Errors | Throw `AppError(code, status, details?)`; central handler returns `{error:{code,message,details?,requestId}}`. Stack traces never sent to client. |
 | Logging | `pino` JSON logs with `requestId`; redact `password`, `cookie`, `authorization`, `MONGODB_URI` |
 | Config | `config/env.ts` parses `process.env` with Zod at startup |
-| Money | Integer satang everywhere; formatting only in UI (`Intl.NumberFormat('th-TH',{style:'currency',currency:'THB'})`) |
+| Money | Integer satang, BSON `int`, bounds and safe-arithmetic rules in DATABASE_DESIGN §1.1; formatting only in UI (`Intl.NumberFormat('th-TH',{style:'currency',currency:'THB'})`) |
 | IDs | MongoDB ObjectId in API; products also addressable by unique `slug` |
 | Time | Stored as UTC `Date`; `createdAt`/`updatedAt` via Mongoose timestamps |
 
@@ -147,8 +156,8 @@ If any conditional stock update matches 0 documents, the service throws `OUT_OF_
 | Level | Tool | Scope |
 |---|---|---|
 | Unit | Vitest | shared schemas, money/pricing, order status transitions, services with mocked repos |
-| Integration | Vitest + Supertest + `mongodb-memory-server` (replica set mode, for transactions) | Every route: auth, authorization (customer vs admin vs guest), validation, checkout stock rules |
-| E2E | Playwright | Browse → search → add to cart → register → checkout; admin login → create/edit/deactivate product |
+| Integration | Vitest + Supertest + `mongodb-memory-server` (replica set mode, for transactions) | Every route: auth, authorization (customer vs admin vs guest), strict validation, checkout stock rules, and the concurrency acceptance criteria AC-F01…AC-R05 in SYSTEM_REQUIREMENTS §7 (run with `Promise.all` against a real replica set) |
+| E2E | Playwright | Browse → search → add to cart → register → checkout; admin login → create/edit/deactivate product; responsive matrix AC-F07 (360–1440 px) |
 | Security | Integration cases + `npm audit` + secret scan in CI | IDOR, NoSQL operator injection, mass assignment, price tampering, CSRF missing token |
 
 ## 7. Assumptions and open decisions
@@ -157,7 +166,7 @@ If any conditional stock update matches 0 documents, the service throws `OUT_OF_
 |---|---|---|
 | AS-1 | Currency THB only, integer satang | Assumed |
 | AS-2 | Product images are URLs (seed uses local `/images/...` served by web or a public CDN) | Assumed; upload is REQ-F05 |
-| AS-3 | Language: TypeScript across web, api, shared | Recommended (ADR-001); switch to JS only if the team requires it |
+| AS-3 | Language: TypeScript across web, api, shared | Baseline confirmed by project owner (M1-003); formal team sign-off pending (ADR-001) |
 | OD-1 | Shipping fee values | Open, config-driven |
 | OD-2 | Whether course graders need Thai UI text | Open |
-| OD-3 | Exact hosting providers | Open; see Deployment |
+| OD-3 | Exact hosting provider | Open. Topology fixed: single same-origin Node service (DEPLOYMENT_DESIGN §3) |
