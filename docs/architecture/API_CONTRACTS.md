@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v7 (M1-013). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v8 (M1-015). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -49,8 +49,10 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within the replay window |
 | 409 | `IDEMPOTENCY_KEY_CLOSED` | The key can't create an order, now or ever (permanent for the account's lifetime): its order's replay window has ended, or the key was closed by a failed checkout or by reconcile. `outcome: ORDER_FOUND` with `details: { orderNumber, createdAt }`, or `outcome: CONFIRMED_NOT_COMMITTED`. Both are decided by reading the key registry **and** `orders` with read concern `majority`. No new order |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
+| 403 | `ACCOUNT_DISABLED` | The account was disabled (DATABASE_DESIGN §7.7), possibly after this request was authenticated. Returned by the checkout and reconcile transactions' account fence; nothing was written. No `outcome` |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
+| 503 | `MAINTENANCE` | Writes are disabled: backup, restore or failed restore validation (DEPLOYMENT_DESIGN §7). Returned before any database work |
 | 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked. On `POST /api/orders` it carries `outcome: UNKNOWN` |
 | 503 | `CHECKOUT_RETRY` | `outcome: UNKNOWN`. The key's outcome could not be established. It means neither "nothing was ordered" nor "an order exists". `Retry-After` header. Retry the same request with the **same** key, or call `POST /api/orders/reconcile`; never start a new key while the outcome is unknown |
 
@@ -219,7 +221,7 @@ Every checkout response tells the client what is known about the **key**:
 | `CONFIRMED_NOT_COMMITTED` | Business errors (`409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`), `409 IDEMPOTENCY_KEY_CLOSED` without an order | The key is durably closed **and** a majority read of `orders` after the closure found no order. No order exists, and this key can never create one. The key is resolved |
 | `UNKNOWN` | `503 CHECKOUT_RETRY`, `500 INTERNAL_ERROR`; also any network failure or timeout seen by the client | Not resolved: a read failed, a write wasn't acknowledged, conflicts persisted past the retry budget, or a commit's result is unresolved. Retry with the same key and payload, or reconcile |
 
-`400`, `401`, `403` and `429` are returned before any database work. They change nothing, and the key keeps whatever outcome it had before.
+`400`, `401`, `403 FORBIDDEN`/CSRF, `429` and `503 MAINTENANCE` are returned before any database work. `403 ACCOUNT_DISABLED` comes from the transaction's account fence, which aborted before writing. Both change nothing, and the key keeps whatever outcome it had before. A disabled account can't check out or reconcile.
 
 | Situation (server time t) | Result |
 |---|---|
@@ -257,7 +259,9 @@ Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EX
 | An order exists for `(session user, key)` | `200 { "data": { "outcome": "ORDER_FOUND", "order": OrderSummary } }` |
 | The key is durably closed (now or earlier) **and** a later majority read of `orders` finds no order | `200 { "data": { "outcome": "CONFIRMED_NOT_COMMITTED" } }` |
 | Couldn't be established (closure not acknowledged within 3 attempts / 5 s, a registry or `orders` read failed or timed out, record not yet majority-visible) | `503 CHECKOUT_RETRY`, `outcome: UNKNOWN`, `Retry-After`. Calling again is safe |
-| No session | `401`; nothing written |
+| No session, or the session of a disabled account | `401`; nothing written |
+| Account disabled after this request was authenticated (the fence transaction's account check failed) | `403 ACCOUNT_DISABLED`; nothing written |
+| Maintenance mode | `503 MAINTENANCE`; nothing written |
 | Missing or invalid CSRF token | `403`; nothing written |
 
 The call is idempotent: once definitive, repeating it returns the same outcome. **Ownership:** the key is always looked up and closed under `session.userId`; there is no user parameter, and admins get no wider access. Another account's key is simply a different `(userId, key)` pair, so the caller gets `CONFIRMED_NOT_COMMITTED` for their **own** namespace and learns nothing about the other account. The other account's record and order are untouched.

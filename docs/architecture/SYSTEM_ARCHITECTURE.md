@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v7 (M1-013). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v8 (M1-015). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -124,6 +124,7 @@ sequenceDiagram
     S-->>E: replay (200) / 422 within replayUntil; else 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED); read failure → 503 UNKNOWN
   else nothing found
     S->>DB: startSession + transaction (own bounded loop: 3 attempts, 10 s)
+    S->>DB: users.updateOne({_id, isActive: true}, {$inc: {accountFence: 1}}) (0 → 403 ACCOUNT_DISABLED)
     S->>DB: insert checkoutKeys {userId, key, state: committed, fingerprint, orderId, createdAt, replayUntil}
     S->>DB: find active products by ids
     S->>S: compute prices (int satang, bounded) and snapshot lines

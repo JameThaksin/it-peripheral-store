@@ -1,6 +1,6 @@
 # Database Design — IT Peripheral Store (MongoDB)
 
-Status: Draft v7 (M1-013). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
+Status: Draft v8 (M1-015). Satisfies REQ-B02, B03, B09, B12. Concurrency policies: [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md). Business rules referenced as BR-xx are in [SYSTEM_REQUIREMENTS.md](../requirements/SYSTEM_REQUIREMENTS.md#6-business-rules--orders-and-inventory).
 
 ## 1. Conventions
 
@@ -90,7 +90,7 @@ erDiagram
   }
 ```
 
-Supporting collections (not part of the four core ones): `checkoutKeys` (durable checkout key registry, F02, M1-013), `sessions` (managed by `connect-mongo`, TTL) and `auditLogs` (admin actions, REQ-E08).
+Supporting collections (not part of the four core ones): `checkoutKeys` (durable checkout key registry, F02, M1-013), `systemState` (restore validation gate, DEPLOYMENT_DESIGN §7), `sessions` (managed by `connect-mongo`, TTL) and `auditLogs` (admin actions, REQ-E08).
 
 ## 3. Embedding vs referencing
 
@@ -120,7 +120,9 @@ Supporting collections (not part of the four core ones): `checkoutKeys` (durable
 | `role` | string | ✓ | enum `customer` \| `admin`; default `customer`; **not settable via public API** |
 | `phone` | string | | ≤ 20, digits/+/-/space |
 | `addresses` | array<Address> | | max 5 |
-| `isActive` | bool | ✓ | default `true`; inactive users cannot log in |
+| `isActive` | bool | ✓ | default `true`. `false` = **disabled** (M1-015): the account can't log in, check out or reconcile. Set only by the `user:disable` maintenance command (§7.7); V1 has no re-enable or delete operation |
+| `disabledAt` | Date | | set with `isActive: false` |
+| `accountFence` | long | ✓ | default `Long(0)`. Incremented in every checkout, reconcile and disable transaction, so they all write this document and serialize (§7.2, §7.7) |
 | `failedLoginCount` | int | ✓ | default 0 |
 | `lockedUntil` | Date | | set after repeated failures |
 | `lastLoginAt` | Date | | |
@@ -147,6 +149,7 @@ Indexes:
       "province": "Bangkok", "postalCode": "10330", "phone": "0800000000" }
   ],
   "isActive": true,
+  "accountFence": { "$numberLong": "0" },
   "failedLoginCount": 0,
   "createdAt": { "$date": "2026-11-14T06:00:00Z" },
   "updatedAt": { "$date": "2026-11-14T06:00:00Z" }
@@ -298,7 +301,7 @@ Indexes:
 
 ### 4.5 Supporting: `checkoutKeys`, `sessions`, `auditLogs`
 
-**`checkoutKeys`**: the durable checkout key registry (F02, ADR-002 D2, M1-011, M1-013). It holds exactly one document per `(userId, key)` and is **insert-only**: no code path updates or deletes a registry document (the only exception is account erasure, below).
+**`checkoutKeys`**: the durable checkout key registry (F02, ADR-002 D2, M1-011, M1-013). It holds exactly one document per `(userId, key)` and is **insert-only**: no code path updates or deletes a registry document. Accounts are never deleted in V1, and disabling an account doesn't touch the registry.
 - A `committed` record is inserted as the first write of the checkout transaction that creates the order. It drives payload-checked replay.
 - A `closed` record is inserted by the fence (§7.2). It means the key can never create an order. It does **not** on its own prove that no order exists: every definitive answer also reads `orders` (§7.2 `resolveKey`).
 
@@ -311,7 +314,7 @@ Because the unique index admits only one of the two, a closed record and a new o
 | `state` | string | ✓ | enum `committed`, `closed`. Never changes after insert |
 | `fingerprint` | string | `committed` only | hex SHA-256 of canonical JSON of the **normalized** request: items sorted by `productId` with merged quantities, `shippingAddress`, `note` |
 | `orderId` | ObjectId → orders | `committed` only | order created with this key |
-| `createdAt` | Date | ✓ | **server time** (API server clock) when the record was written: step 1 of the checkout transaction (before its commit), or the fence write |
+| `createdAt` | Date | ✓ | **server time** (API server clock) when the record was written: step 2 of the checkout transaction (before its commit), or step 2 of the fence transaction |
 | `replayUntil` | Date | `committed` only | `createdAt + 24 h`. Selects the **response type** only (replay vs `409`), and has no effect on whether the key may be reused (it never may) |
 
 Indexes: `{ userId: 1, key: 1 }` unique. There is **no TTL index** and no expiry field. `db:migrate` never creates one, and `db:verify` fails if any TTL index exists on `checkoutKeys` (AC-M12-N2a).
@@ -326,17 +329,12 @@ Indexes: `{ userId: 1, key: 1 }` unique. There is **no TTL index** and no expiry
 
 A closed record looks like `{ userId, key, state: "closed", createdAt }`.
 
-**Retention and account erasure (M1-013 N2).**
-- **Guarantee lifetime = the account's lifetime.** Registry records are kept as long as the user account exists. No cleanup job, TTL or archive step touches them, so no cleanup policy can shorten the guarantee.
-- **Size.** About 200 bytes per key. Growth is bounded by the rate limits: 20 checkouts plus 10 reconciles per user per hour (API_CONTRACTS §3.3). That is negligible at coursework scale, and the weekly backup job reports the registry size (DEPLOYMENT_DESIGN §7).
-- **Account erasure.** No API deletes accounts in the current scope. If an erasure request must be honored, a reviewed maintenance command handles it in this order:
-  1. Disable the account and destroy its sessions, so no new checkout or reconcile can start.
-  2. Wait longer than the 60 s transaction lifetime limit, so no checkout transaction for the user can still commit.
-  3. Delete or anonymize the user's orders according to the legal retention rules that apply.
-  4. Delete the user's `checkoutKeys` and the user document.
-
-  The guarantee ends with the account. ObjectIds are never reused, so a new account can't inherit, or collide with, the deleted user's keys.
-- **Backups.** Restoring the database to an earlier point also restores the registry to that point. Closures and orders acknowledged after the restore point are lost together, so guarantees given after the restore point don't survive a restore. Restores are a documented operational exception (DEPLOYMENT_DESIGN §7).
+**Retention and accounts (M1-013 N2, M1-015 B1).**
+- **Guarantee lifetime = the account's lifetime, and V1 never deletes accounts.** Registry records are therefore kept permanently. No cleanup job, TTL or archive step touches them, so no cleanup policy can shorten the guarantee.
+- **Size.** About 200 bytes per key. Growth is bounded by the rate limits: 20 checkouts plus 10 reconciles per user per hour (API_CONTRACTS §3.3). That is negligible at coursework scale, and the backup job reports the registry size (DEPLOYMENT_DESIGN §7).
+- **Disablement is the only supported account action (V1).** `user:disable` (§7.7) sets `isActive: false` in a transaction that conflicts with every in-flight checkout and reconcile for that user. It **never** deletes or changes `checkoutKeys`, `orders` or other user data.
+- **Permanent erasure is out of scope.** Deleting an account, its orders or its registry records is not supported. It would need a separately reviewed protocol covering legal retention of orders, the effect on I1/I2 for that user, backups that still contain the data, and a fencing mechanism equivalent to §7.7. No time delay is accepted as a substitute for that fence.
+- **Backups and restores** follow DEPLOYMENT_DESIGN §7. A restore to an older point is outside the registry guarantee; the limitations are listed there.
 
 - `sessions`: managed by `connect-mongo`; `{ _id: sid, expires: Date, session: string }`; TTL index on `expires`.
 - `auditLogs`: `{ actorId, action ('product.create' …), entity, entityId, changes (diff, no secrets), ip, requestId, createdAt }`; index `{ entity: 1, entityId: 1, createdAt: -1 }`, TTL 365 days (assumption).
@@ -411,6 +409,7 @@ The request is validated and normalized before any database work (merge duplicat
 | I2 | A durably closed key never creates an order during its closure lifetime (the account's lifetime) | The `closed` registry record holds the unique `(userId, key)` entry that every checkout transaction must insert, and it is never deleted while the account exists (§4.5) |
 | I3 | No false definitive negative while an earlier checkout may still commit | `CONFIRMED_NOT_COMMITTED` requires a majority-committed `closed` record **and** a later majority read of `orders` that finds nothing |
 | I4 | An unresolved outcome is never silently converted into a definitive failure | Every error, timeout or ambiguous read that isn't listed as definitive below maps to `UNKNOWN` (`503`) |
+| I5 | No checkout or reconcile write commits after the account's disablement commits (M1-015) | Each such transaction first writes the user document conditional on `isActive: true` (step 1), and disablement writes the same document (§7.7, M5) |
 
 **Feasibility under MongoDB semantics (checked before the M1-013 edits).** The design relies only on these documented behaviors:
 
@@ -420,10 +419,11 @@ The request is validated and normalized before any database work (merge duplicat
 | M2 | A transaction whose `commitTransaction` was never sent never commits. It is aborted on error, on session end, or at the latest by `transactionLifetimeLimitSeconds` (60 s, §7.6). |
 | M3 | A write acknowledged with write concern `majority` survives failover. Read concern `majority` returns only majority-committed data. |
 | M4 | A transaction's writes become majority-committed together. Within one causally consistent session, a majority read issued after another majority read observes at least the same state. |
+| M5 | Two transactions that write the same document can't both commit: the later writer gets `WriteConflict` (snapshot isolation). Used for account disablement (§7.7). |
 
 **Not** relied on: that a conflicting write waits for an open transaction (it may wait, fail with a conflict, or time out); any particular scheduling order; TTL timing (there is no TTL); and the success of any single attempt.
 
-Conclusion: M1–M4 are sufficient for **safety** (I1–I4). They do not guarantee **liveness**. During failover, write-concern timeouts, persistent conflicts or a transaction left open after a lost `abortTransaction` (up to 60 s), the answer can be `UNKNOWN` until the condition clears. I2 lasts only as long as the registry record exists, which is why the registry is permanent for the account's lifetime (§4.5). A database restore to an earlier point is outside the guarantee (§4.5).
+Conclusion: M1–M5 are sufficient for **safety** (I1–I4, and I5 below). They do not guarantee **liveness**. During failover, write-concern timeouts, persistent conflicts or a transaction left open after a lost `abortTransaction` (up to 60 s), the answer can be `UNKNOWN` until the condition clears. I2 lasts only as long as the registry record exists, which is why the registry is permanent for the account's lifetime (§4.5). A database restore to an earlier point is outside the guarantee (§4.5).
 
 ***resolveKey*** `(userId, key)`. Read-only. Both reads use the primary, read concern `majority` and `maxTimeMS: 2000`, in one causally consistent session, and run **in this order**:
 
@@ -450,10 +450,11 @@ Why `CONFIRMED_NOT_COMMITTED` is sound: the `closed` record is majority-committe
 
 **Transaction body** (one attempt)
 
-1. Insert `checkoutKeys { userId, key, state: 'committed', fingerprint, orderId, createdAt: t1, replayUntil: t1 + 24 h }`, where t1 is server time at this step. This is the first write: it claims the key's unique entry.
-2. Load the products; each must be `isActive: true`, else throw `PRODUCT_UNAVAILABLE`.
-3. Apply the checkout decrement of §7.1 per line. Zero matches → re-read to choose between `OUT_OF_STOCK` and `PRODUCT_UNAVAILABLE`, then throw.
-4. Compute the money (§1.1) and insert the order with the pre-generated `_id`, `orderNumber` and `idempotencyKey`.
+1. **Account fence (M1-015).** `users.updateOne({ _id: userId, isActive: true }, { $inc: { accountFence: Long(1) } })`. Matched 0 → throw `ACCOUNT_DISABLED` (nothing written). Because this writes the user document, the transaction conflicts with a concurrent disablement (M5): whichever commits first wins, and the other is aborted or sees the new state on retry. No waiting is assumed.
+2. Insert `checkoutKeys { userId, key, state: 'committed', fingerprint, orderId, createdAt: t2, replayUntil: t2 + 24 h }`, where t2 is server time at this step. This claims the key's unique entry.
+3. Load the products; each must be `isActive: true`, else throw `PRODUCT_UNAVAILABLE`.
+4. Apply the checkout decrement of §7.1 per line. Zero matches → re-read to choose between `OUT_OF_STOCK` and `PRODUCT_UNAVAILABLE`, then throw.
+5. Compute the money (§1.1) and insert the order with the pre-generated `_id`, `orderNumber` and `idempotencyKey`.
 
 **Attempt states (G01).** Every checkout *attempt* ends in exactly one of three states:
 
@@ -465,21 +466,25 @@ Why `CONFIRMED_NOT_COMMITTED` is sound: the `closed` record is majority-committe
 
 **Key outcomes (M1-011 F2).** Separately from attempts, every checkout and reconcile response reports the outcome **for the key** in the `outcome` field (API_CONTRACTS §1.1): `ORDER_FOUND`, `CONFIRMED_NOT_COMMITTED` or `UNKNOWN`. The only sources of the first two are `resolveKey` and an acknowledged commit. An empty read never yields `CONFIRMED_NOT_COMMITTED` (`ABSENT` is not an outcome). A `closed` record never yields it without the `orders` read (N1).
 
-***Fence*** `closeKey(userId, key)`. Outside any transaction. At most 3 insert attempts, backoff 100 ms then 400 ms, overall deadline 5 s:
+***Fence*** `closeKey(userId, key)`. A short transaction (M1-015), with write concern `majority`. At most 3 attempts, backoff 100 ms then 400 ms, overall deadline 5 s:
 
 ```
 repeat:
-  insertOne({ userId, key, state: 'closed', createdAt: t },
-            { writeConcern: { w: 'majority', wtimeout: 2000 } })   // retryable write
-  acknowledged             → return resolveKey()   // CONFIRMED_NOT_COMMITTED, or ORDER_FOUND (anomaly, alert), or UNKNOWN on read failure
-  E11000                   → x = resolveKey(); if x ∈ {ORDER_FOUND, CONFIRMED_NOT_COMMITTED}: return x
+  transaction:
+    1. users.updateOne({ _id: userId, isActive: true }, { $inc: { accountFence: Long(1) } })
+       matched 0 → abort → return ACCOUNT_DISABLED
+    2. checkoutKeys.insertOne({ userId, key, state: 'closed', createdAt: t })
+  commit acknowledged      → return resolveKey()   // CONFIRMED_NOT_COMMITTED, or ORDER_FOUND (anomaly, alert), or UNKNOWN on read failure
+  E11000 at step 2         → abort; x = resolveKey(); if x ∈ {ORDER_FOUND, CONFIRMED_NOT_COMMITTED}: return x
                              // ABSENT/UNKNOWN: the record exists on the primary but isn't majority-visible yet → next attempt
-  WriteConflict, NotWritablePrimary, network error, wtimeout, maxTimeMS
-                           → this insert may or may not have applied; x = resolveKey(); if definitive: return x; else next attempt
+  WriteConflict / TransientTransactionError, or any error before commit was sent
+                           → abort; nothing committed (M2); next attempt
+  commit result unresolved (UnknownTransactionCommitResult, network error or timeout after commit sent)
+                           → x = resolveKey(); if definitive: return x; else next attempt
 attempts or deadline exhausted → UNKNOWN
 ```
 
-Whether the insert waits for an open checkout transaction, fails at once with a conflict, or times out, every branch above is safe. Re-inserting is harmless: it lands in the `E11000` branch. A successful fence followed by a failed read returns `UNKNOWN`; the key is closed regardless, and the next reconcile returns `CONFIRMED_NOT_COMMITTED`.
+Whether the fence waits for an open checkout transaction, fails at once with a conflict, or times out, every branch above is safe. Retrying is harmless: an applied earlier attempt makes step 2 fail with `E11000`. A successful fence followed by a failed read returns `UNKNOWN`; the key is closed regardless, and the next reconcile returns `CONFIRMED_NOT_COMMITTED`. `ACCOUNT_DISABLED` returns no key outcome.
 
 The fence runs in exactly two places: after a business error, and in `POST /api/orders/reconcile` (API_CONTRACTS §3.3). It never runs on a plain retry, so a same-key retry within the window can still complete the purchase.
 
@@ -491,8 +496,9 @@ The fence runs in exactly two places: after a business error, and in `POST /api/
 | `E11000` on the `checkoutKeys` `{userId,key}` index | Not committed. Another checkout committed the key, or a closed record exists → poll `resolveKey` every 250 ms for up to 3 s: definitive → answer as in step 0; still `ABSENT`/`UNKNOWN` → `503`, `UNKNOWN` |
 | `WriteConflict` / `TransientTransactionError` (from any statement, e.g. the registry insert racing a fence or another checkout) | Not committed. Abort; next attempt if the attempts and deadline allow, else `503`, `UNKNOWN`. Concurrent operations are **not** assumed to wait |
 | Business error (`OUT_OF_STOCK`, `PRODUCT_UNAVAILABLE`, `ORDER_LIMIT_EXCEEDED`) before commit | Not committed for this attempt. Run the *Fence*. `CONFIRMED_NOT_COMMITTED` → return the business error with that outcome; the key is now closed, so a new checkout needs a new key. `ORDER_FOUND` (a concurrent same-key request committed first) → answer as in step 0. `UNKNOWN` → `503`, `UNKNOWN`. So a business error is never returned while another transaction for the key could still commit |
+| `ACCOUNT_DISABLED` thrown at step 1 (the account was disabled, possibly after this request was authenticated) | Not committed; nothing written. → `403 ACCOUNT_DISABLED`, no `outcome`. No fence, no further attempt. A business-error fence that returns `ACCOUNT_DISABLED` is answered the same way |
 | `E11000` on `orders.orderNumber` | Not committed: regenerate `orderNumber` and `orderId`, then next attempt |
-| `E11000` on `orders {userId, idempotencyKey}` | Not committed. Can't occur while the registry is intact, because step 1 fails first. → `resolveKey` → `ORDER_FOUND` → `409 IDEMPOTENCY_KEY_CLOSED` plus an integrity alert; otherwise `503`, `UNKNOWN` |
+| `E11000` on `orders {userId, idempotencyKey}` | Not committed. Can't occur while the registry is intact, because step 2 fails first. → `resolveKey` → `ORDER_FOUND` → `409 IDEMPOTENCY_KEY_CLOSED` plus an integrity alert; otherwise `503`, `UNKNOWN` |
 | `E11000` on any other index | Not committed: `500 INTERNAL_ERROR` with outcome `UNKNOWN`, logged with the index name; no retry |
 | Any other error or timeout **before** `commitTransaction` was sent (statement timeout, network error, `abortTransaction` failing) | Not committed for this attempt (M2). A transaction whose abort was lost may still hold the key's entry until the server aborts it (≤ 60 s). Next attempt if allowed, else `503`, `UNKNOWN` |
 | Commit result unresolved (`UnknownTransactionCommitResult` after the driver's same-transaction commit retries, a network error or timeout after the commit was sent, `maxCommitTimeMS` exceeded) | **Unknown** → poll `resolveKey` every 250 ms for up to 3 s. `ORDER_FOUND` with our `orderId` → `201`. Another `ORDER_FOUND` → as in step 0. `CONFIRMED_NOT_COMMITTED` → `409 IDEMPOTENCY_KEY_CLOSED` (our transaction lost the unique entry). Still `ABSENT`/`UNKNOWN` → `503`, `UNKNOWN`, `Retry-After: 5`. No fence, no further attempt |
@@ -504,7 +510,7 @@ The fence runs in exactly two places: after a business error, and in `POST /api/
 
 | Item | Definition |
 |---|---|
-| Window start | `createdAt` = server time at step 1, inside the transaction that creates the order. It is recorded **before** the commit and precedes it by the transaction's duration (budget 1 s; hard limit 60 s, §7.6). No commit timestamp is recorded, and none is claimed. |
+| Window start | `createdAt` = server time at step 2, inside the transaction that creates the order. It is recorded **before** the commit and precedes it by the transaction's duration (budget 1 s; hard limit 60 s, §7.6). No commit timestamp is recorded, and none is claimed. |
 | Replay window | While server time t < `replayUntil` (= `createdAt` + 24 h): same key and fingerprint → `200` replay; different fingerprint → `422`. Measured from the commit, the window lasts **at least 24 h minus the transaction's duration**. |
 | After the window | t ≥ `replayUntil` → `409 IDEMPOTENCY_KEY_CLOSED`, outcome `ORDER_FOUND`. The record stays unchanged. |
 | Reuse prevention | **Permanent** for the account's lifetime: committed and closed records are never deleted or changed (§4.5). A delayed request with a closed key, even years later, gets `409 IDEMPOTENCY_KEY_CLOSED`. It can't revive the key, because checkout only inserts and the unique entry is taken. |
@@ -514,7 +520,7 @@ The fence runs in exactly two places: after a business error, and in `POST /api/
 **Guarantees, kept separate**
 
 - **Exactly-once business effect.** At most one order and one set of stock decrements per `(userId, key)`, ever (I1). A client that retries with the same key and payload until it gets a definitive key outcome ends with exactly one order, or a confirmed non-order.
-- **Key registry retention.** Permanent for the account's lifetime; it ends only with account erasure (§4.5).
+- **Key registry retention.** Permanent: V1 never deletes accounts, and disablement leaves the registry untouched (§4.5).
 - **Unknown outcomes.** Reported only as `UNKNOWN` (`503`, or `500` for unexpected index errors). They are resolved only by a same-key retry or by the fence (reconcile), never by time.
 - **Client retries.** Same key and identical payload only, automatic for at most 24 h after the first send.
 - **New checkout authorization.** A new key only after the previous key has a definitive outcome **and** the user explicitly starts a new checkout (API_CONTRACTS §3.3).
@@ -632,8 +638,28 @@ Every path that can increase a category's count writes that category document wi
 
 - Transactions require a **replica set or sharded cluster**. Atlas clusters, including the free **M0**, are 3-node replica sets. A standalone local `mongod` does **not** support transactions, so local development uses the Docker single-node replica set from DEPLOYMENT_DESIGN §2 (or an Atlas dev cluster), and tests use `MongoMemoryReplSet`.
 - Atlas **M0/Flex limits** to plan for: shared throughput caps, a connection limit (pool `maxPoolSize: 10`), 512 MB storage on M0, no managed backups on M0 (DEPLOYMENT_DESIGN §7), and some operators such as `$where` and server-side JavaScript are unavailable. Check current Atlas docs at setup time, because tier limits change.
-- Default transaction lifetime limit (`transactionLifetimeLimitSeconds`) is 60 s; it must not be raised. Ours are far shorter. §7.2 and §4.5 rely on this bound: a transaction whose commit was never sent is aborted by the server within 60 s (M2), which bounds how long a lost abort can hold a key and how long account erasure must wait. §7.2 does **not** assume that a conflicting write waits for an open transaction.
+- Default transaction lifetime limit (`transactionLifetimeLimitSeconds`) is 60 s; it must not be raised. Ours are far shorter. The limit bounds how long a transaction with a lost abort can hold a key or the user document (liveness only, §7.2). **No safety property depends on waiting for it**: account disablement is fenced by a document conflict (§7.7), and §7.2 does not assume a conflicting write waits.
 - Without transactions the policies above don't hold, so the API refuses to start unless `hello` reports a replica set (`setName` present) with a writable primary.
+
+### 7.7 Account disablement (M1-015 B1)
+
+`npm run user:disable -- --email <address> --reason <text>` is a maintenance command run by an operator; V1 has no API endpoint for it. It runs one transaction with write concern `majority`:
+
+```
+users.updateOne({ _id }, { $set: { isActive: false, disabledAt: now }, $inc: { accountFence: Long(1) } })
+auditLogs.insertOne({ action: 'user.disable', entityId: _id, reason, ... })
+```
+
+- **Fencing, not timing.** Every checkout and reconcile transaction writes the same user document, conditional on `isActive: true` (§7.2 step 1, fence step 1). By M5, a disablement and an overlapping checkout or reconcile can't both commit:
+  - Checkout committed first: the order was placed while the account was active, which is allowed.
+  - Disablement committed first: the checkout's or reconcile's conditional update matches 0, on its first try or after a `WriteConflict` retry → `ACCOUNT_DISABLED`, and nothing is written.
+
+  This holds whether the second operation waits, conflicts or times out, and it uses no delay.
+- **Retries.** At most 5 attempts on `WriteConflict`/`TransientTransactionError`. If the commit result is unresolved → majority read of `isActive`: `false` → done; `true` → retry. If still unresolved after the attempts, the command exits non-zero and the operator reruns it, which is idempotent.
+- **Sessions.** `requireAuth` loads the user on every request and destroys the session of a disabled account (`401`). This is a convenience; the transactional fence is the guarantee, including for requests authenticated just before disablement.
+- **Read-only answers.** A request authenticated before disablement may still receive a read-only answer about an order that already exists (step 0 replay). No write can commit after the disablement.
+- **Never touched.** `checkoutKeys`, `orders`, addresses and audit logs are unchanged. Re-enabling and deletion are out of scope for V1 (§4.5).
+- **Other user-document writers** (login counters, `lastLoginAt`, profile edits) can conflict with checkout too. They are short and retried within the same bounds; a persistent conflict ends as `UNKNOWN` (checkout) or a retryable error.
 
 ## 8. Seeding and migration
 
@@ -645,5 +671,15 @@ Every path that can increase a category's count writes that category document wi
   - There is no `$set` anywhere in the seed. Changing existing seeded data (e.g. a corrected price) requires a reviewed one-off migration that uses the normal service operations (§7.1 for stock).
   - **Safe on a live database**: seed writes are inserts plus conditional counter increments through the §7.5 path, so they serialize with concurrent product, category and checkout operations exactly as API writes do. Two seeds running at once are also safe: the unique `sku`/`slug`/`email` indexes let only one insert win, and the loser's upsert matches the existing document without changing it.
 - `npm run db:verify` → read-only check of the §7.5 invariant (each `activeProductCount` equals its active-product count; no active product in an inactive category), the BSON types (`int` for money and stock, `long` for `inventoryRevision`), and `stock ≥ 0`. It exits non-zero on drift. `npm run db:verify -- --repair` fixes counter drift one category at a time, in a transaction that recomputes the count and `$set`s it on the category document. That write conflicts with any concurrent product transition touching the same category, so a repair can't commit a stale count. Repair is a maintenance command and is logged to `auditLogs`.
+- `npm run db:fingerprint` → read-only. Computes a SHA-256 over every document of every application collection, ordered by `_id`, using read concern `majority`, plus per-collection counts. It is used by the quiesced backup and the restore validation (DEPLOYMENT_DESIGN §7).
+- `npm run db:verify -- --restore` → everything `db:verify` checks, plus the registry/orders invariants:
+  - every order has a `committed` `checkoutKeys` record for `(userId, idempotencyKey)` with the same `orderId`;
+  - every `committed` record has its order;
+  - no `closed` record coexists with an order for the same key;
+  - the unique indexes on `checkoutKeys` and `orders` exist, and there is no TTL on `checkoutKeys`;
+  - for a dump-based restore, the fingerprint equals the backup manifest.
+
+  Only if every check passes does it set `systemState { _id: 'restore', status: 'validated' }` (write concern `majority`). Otherwise it leaves `pending` and exits non-zero (DEPLOYMENT_DESIGN §7).
+- `npm run user:disable` → §7.7.
 - `npm run db:reset` → drops and recreates the database, then migrates and seeds. It refuses to run unless `NODE_ENV` is `development` or `test`, `MONGODB_DB_NAME` ends with `_dev` or `_test`, and `--confirm` is passed. It is never run against staging or production, or while the API is serving traffic.
 - A CI integration test asserts `products.countDocuments({isActive:true}) >= 30` after seeding (REQ-B02 traceability), and AC-G02 checks that a rerun changes nothing.
