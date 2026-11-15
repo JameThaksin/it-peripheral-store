@@ -1,6 +1,6 @@
 # Deployment Design — IT Peripheral Store
 
-Status: Draft v4 (M1-007). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
+Status: Draft v5 (M1-013). **Design only — nothing is deployed in this task.** Selected topology: **single same-origin Node service** (ADR-001).
 
 ## 1. Environments
 
@@ -163,6 +163,8 @@ Config is parsed with Zod at API startup; a missing or malformed required variab
 - Targets (assumptions for coursework): RPO 7 days on M0, RTO 2 hours. Real production: RPO ≤ 1 h, RTO ≤ 1 h.
 - Restore drill once before final submission: restore latest dump into a staging DB and run smoke tests.
 - Backups contain PII and password hashes: encrypt at rest, restrict access to admins of the team.
+- **Restores and the checkout key registry (M1-013).** A restore returns `checkoutKeys` and `orders` to the same earlier point, so they stay consistent with each other. Key closures and orders acknowledged after the restore point are lost, so any guarantee given after that point does not survive. After a restore, announce the incident; affected customers check "My orders". This is the only operational path that can remove registry records besides account erasure (DATABASE_DESIGN §4.5).
+- The weekly backup job also reports the `checkoutKeys` document count and storage size, so registry growth is visible (DATABASE_DESIGN §4.5).
 
 ## 8. Deployment workflow
 

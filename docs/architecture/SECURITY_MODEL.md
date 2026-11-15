@@ -1,6 +1,6 @@
 # Security Model — IT Peripheral Store
 
-Status: Draft v6 (M1-011). No real secrets appear in this or any document; values shown are placeholders.
+Status: Draft v7 (M1-013). No real secrets appear in this or any document; values shown are placeholders.
 
 ## 1. Assets and trust boundaries
 
@@ -34,7 +34,7 @@ Everything from the browser — body, query, params, headers, cookies, cart cont
 | T7 | **Missing rate limiting / abuse** | Scraping, order spam, password spraying | `express-rate-limit` with MongoDB store: global 300 req/15 min/IP; auth limits above; orders 20/h/user; body size 100 kb | Test: N+1 request → 429 |
 | T8 | **Mass assignment** | Register with `"role":"admin"`; PATCH product with `createdBy`; PATCH `/users/me` with `role` | Zod `.strict()` on **every** object schema, nested included (body, query, params); unknown keys rejected, never stripped; Mongoose `strict: 'throw'`; services build documents from explicit fields only; never `Model.create(req.body)` | AC-F03a/b: top-level and nested extra fields → 400, no write |
 | T9 | **Order price manipulation** | Client sends `"priceSatang":1` or edits `localStorage` cart | Order schema contains no money fields; server loads current price from DB, computes all totals in bounded int32 satang with safe-integer checks (DATABASE_DESIGN §1.1); quantity bounds applied **after** merging duplicate lines (BR-04); cart quote endpoint is informational only | Test: price fields → 400; total matches DB price; AC-F05; AC-R03 |
-| T10 | **Inventory race conditions** | Two customers buy the last unit; stale admin stock value overwrites sales; double submit; double cancel; delete during checkout | All write paths in DATABASE_DESIGN §7: conditional `$inc` in transactions; every stock mutation increments `inventoryRevision`; admin stock relative or `expectedRevision`-preconditioned; idempotency records with fingerprint; conditional status transitions restore stock once; soft delete only; `$jsonSchema minimum: 0` | 10 parallel orders for stock 3 → exactly 3 succeed, stock = 0; AC-F01a–d, AC-F02a–e, AC-M10-F1a–e, AC-M10-F2a–e, AC-M10-F3a–e, AC-R2a–c, AC-G01a/b, AC-G02a/b, AC-G03a/b, AC-G04, AC-R01, AC-R02a–e, AC-R05a/c |
+| T10 | **Inventory race conditions** | Two customers buy the last unit; stale admin stock value overwrites sales; double submit; double cancel; delete during checkout | All write paths in DATABASE_DESIGN §7: conditional `$inc` in transactions; every stock mutation increments `inventoryRevision`; admin stock relative or `expectedRevision`-preconditioned; idempotency records with fingerprint; conditional status transitions restore stock once; soft delete only; `$jsonSchema minimum: 0` | 10 parallel orders for stock 3 → exactly 3 succeed, stock = 0; AC-F01a–d, AC-F02a–e, AC-M10-F1a–e, AC-M10-F2a–e, AC-M10-F3a–e, AC-M12-N1a–c, AC-M12-N2a–d, AC-M12-N3a–d, AC-R2a–c, AC-G01a/b, AC-G02a/b, AC-G03a/b, AC-G04, AC-R01, AC-R02a–e, AC-R05a/c |
 
 Additional: local development database exposure (unauthenticated MongoDB published on all interfaces) is prevented by loopback-only port publishing (DEPLOYMENT_DESIGN §2.2, AC-N01); clickjacking (`frame-ancestors 'none'`), dependency vulnerabilities (`npm audit --audit-level=high` in CI, Dependabot), open redirect (post-login redirect accepts only relative paths).
 

@@ -1,6 +1,6 @@
 # System Architecture — IT Peripheral Store
 
-Status: Draft v6 (M1-011). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
+Status: Draft v7 (M1-013). Related: [Requirements](../requirements/SYSTEM_REQUIREMENTS.md) · [Database](DATABASE_DESIGN.md) · [API](API_CONTRACTS.md) · [Security](SECURITY_MODEL.md) · [Deployment](DEPLOYMENT_DESIGN.md) · [ADR-001](../decisions/ADR-001-TECH_STACK.md) · [ADR-002](../decisions/ADR-002-DATA_CONSISTENCY.md)
 
 ## 1. Overview
 
@@ -119,12 +119,12 @@ sequenceDiagram
   E->>E: helmet, rate-limit, session, csrf, requireAuth, validate(CreateOrder, strict)
   E->>S: createOrder(userId, dto)
   S->>S: normalize lines (merge duplicates, then check qty 1–10), fingerprint
-  S->>DB: startSession + withTransaction
-  S->>DB: find idempotencyKeys {userId, key} (no key-age check)
-  alt record exists
-    S-->>E: committed and now < replayUntil → replay (200) or 422; otherwise 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED)
-  else new key
-    S->>DB: insert idempotencyKeys {userId, key, state: committed, fingerprint, orderId, createdAt, replayUntil}
+  S->>DB: resolveKey: majority read checkoutKeys {userId, key}, then orders {userId, idempotencyKey} (no key-age check)
+  alt order or closed record found
+    S-->>E: replay (200) / 422 within replayUntil; else 409 IDEMPOTENCY_KEY_CLOSED (ORDER_FOUND / CONFIRMED_NOT_COMMITTED); read failure → 503 UNKNOWN
+  else nothing found
+    S->>DB: startSession + transaction (own bounded loop: 3 attempts, 10 s)
+    S->>DB: insert checkoutKeys {userId, key, state: committed, fingerprint, orderId, createdAt, replayUntil}
     S->>DB: find active products by ids
     S->>S: compute prices (int satang, bounded) and snapshot lines
     loop each line
@@ -136,7 +136,7 @@ sequenceDiagram
   E-->>B: response
 ```
 
-If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no idempotency record). Before returning the error, the service **fences** the key by inserting a `closed` tombstone (write concern `majority`), so the error can carry the definitive outcome `CONFIRMED_NOT_COMMITTED`. Concurrent requests with the same key collide on the unique `idempotencyKeys` index. `withTransaction` retries only transient errors (`WriteConflict` while the winner is uncommitted). A duplicate-key error after the winner commits, an unresolved commit result, or an exhausted retry is handled by the service **outside the aborted transaction**. An unresolved commit is treated as **unknown**, never as failed: the service re-reads the key record (majority) and replays, rejects, or returns `503 CHECKOUT_RETRY` with outcome `UNKNOWN`. Only a successful tombstone write, never an empty read, proves that no order exists; clients obtain one via `POST /api/orders/reconcile` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
+If any conditional stock update matches 0 documents, the service throws `OUT_OF_STOCK` or `PRODUCT_UNAVAILABLE` and the transaction aborts (no partial decrement, no registry record). Before returning the error, the service **fences** the key by inserting a `closed` record into the permanent `checkoutKeys` registry (write concern `majority`) and then checks `orders`, so the error can carry the definitive outcome `CONFIRMED_NOT_COMMITTED`. Concurrent requests with the same key collide on the unique `checkoutKeys` index; the service does not assume a conflicting operation waits. `WriteConflict`, duplicate-key errors, timeouts and unresolved commits are handled **outside the aborted transaction** with bounded retries. An unresolved commit is treated as **unknown**, never as failed. Definitive answers come only from `resolveKey`, a majority read of the registry followed by a majority read of `orders`. Any failure there gives `503 CHECKOUT_RETRY` with outcome `UNKNOWN`. A closed marker alone, or an empty read, never proves that no order exists. Clients obtain a definitive outcome via `POST /api/orders/reconcile` (DATABASE_DESIGN §7.2). All write paths that compete with checkout are listed in DATABASE_DESIGN §7.
 
 ## 5. Cross-cutting concerns
 

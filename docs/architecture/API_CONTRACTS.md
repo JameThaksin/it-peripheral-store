@@ -1,6 +1,6 @@
 # API Contracts — IT Peripheral Store
 
-Status: Draft v6 (M1-011). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
+Status: Draft v7 (M1-013). Base path `/api`. JSON only. Schemas live in `packages/shared/src/schemas` and are the source of truth; tables below summarise them.
 
 ## 1. Conventions
 
@@ -47,11 +47,11 @@ Offset pagination is acceptable at this scale (≤ thousands of docs). All filte
 | 409 | `PRODUCT_CONFLICT` | Product changed concurrently and the transition couldn't be re-applied within 3 tries; reload and retry |
 | 409 | `INVENTORY_LIMIT` | Cancellation would push a product's stock past the int32 hard limit; nothing changed (order keeps its status); `details: [{productId, currentStock, quantity}]`. Recover by lowering stock, then retry (DATABASE_DESIGN §7.4) |
 | 422 | `IDEMPOTENCY_KEY_REUSED` | Same idempotency key with a different payload within the replay window |
-| 409 | `IDEMPOTENCY_KEY_CLOSED` | The key can't create an order: its order's replay window has ended, or the key was closed by a failed checkout or by reconcile. `outcome: ORDER_FOUND` with `details: { orderNumber, createdAt }`, or `outcome: CONFIRMED_NOT_COMMITTED`. No new order |
+| 409 | `IDEMPOTENCY_KEY_CLOSED` | The key can't create an order, now or ever (permanent for the account's lifetime): its order's replay window has ended, or the key was closed by a failed checkout or by reconcile. `outcome: ORDER_FOUND` with `details: { orderNumber, createdAt }`, or `outcome: CONFIRMED_NOT_COMMITTED`. Both are decided by reading the key registry **and** `orders` with read concern `majority`. No new order |
 | 422 | `ORDER_LIMIT_EXCEEDED` | Order total > 1,000,000,000 satang (BR-15) |
 | 423 | `ACCOUNT_LOCKED` | Too many failed logins |
 | 429 | `RATE_LIMITED` | Rate limit hit; `Retry-After` header |
-| 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked |
+| 500 | `INTERNAL_ERROR` | Unexpected; no internals leaked. On `POST /api/orders` it carries `outcome: UNKNOWN` |
 | 503 | `CHECKOUT_RETRY` | `outcome: UNKNOWN`. The key's outcome could not be established. It means neither "nothing was ordered" nor "an order exists". `Retry-After` header. Retry the same request with the **same** key, or call `POST /api/orders/reconcile`; never start a new key while the outcome is unknown |
 
 ## 2. Endpoint index
@@ -216,8 +216,8 @@ Every checkout response tells the client what is known about the **key**:
 | Outcome | Responses that carry it | Client meaning |
 |---|---|---|
 | `ORDER_FOUND` | `201`, `200` replay, `409 IDEMPOTENCY_KEY_CLOSED` with `orderNumber` | An order exists for this key. Show it. The key is resolved |
-| `CONFIRMED_NOT_COMMITTED` | Business errors (`409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`), `409 IDEMPOTENCY_KEY_CLOSED` without an order | No order exists, and this key can never create one (the server wrote a tombstone first). The key is resolved |
-| `UNKNOWN` | `503 CHECKOUT_RETRY`; also any network failure or timeout seen by the client | Not resolved. Retry with the same key and payload, or reconcile |
+| `CONFIRMED_NOT_COMMITTED` | Business errors (`409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED`), `409 IDEMPOTENCY_KEY_CLOSED` without an order | The key is durably closed **and** a majority read of `orders` after the closure found no order. No order exists, and this key can never create one. The key is resolved |
+| `UNKNOWN` | `503 CHECKOUT_RETRY`, `500 INTERNAL_ERROR`; also any network failure or timeout seen by the client | Not resolved: a read failed, a write wasn't acknowledged, conflicts persisted past the retry budget, or a commit's result is unresolved. Retry with the same key and payload, or reconcile |
 
 `400`, `401`, `403` and `429` are returned before any database work. They change nothing, and the key keeps whatever outcome it had before.
 
@@ -230,10 +230,11 @@ Every checkout response tells the client what is known about the **key**:
 | Key closed by a failed checkout or by reconcile | `409 IDEMPOTENCY_KEY_CLOSED`, `CONFIRMED_NOT_COMMITTED`; **no new order** |
 | Concurrent requests with the same key | One commits; the others replay its order (`200`) once it is majority-visible, else `503` (`UNKNOWN`) |
 | Business error (stock, availability, limit) | The server first closes the key (fence), then returns the error with `CONFIRMED_NOT_COMMITTED`. If a concurrent same-key request committed first, it returns that order instead. If the fence can't be confirmed → `503`, `UNKNOWN` |
-| Commit outcome unknown | The server re-reads the key record (majority) for up to 3 s. Found → `201`/`200`; tombstone → `409 IDEMPOTENCY_KEY_CLOSED`, `CONFIRMED_NOT_COMMITTED`; still absent → `503 CHECKOUT_RETRY`, `UNKNOWN`. Absence is **never** reported as "no order" |
+| Commit outcome unknown | The server re-reads the registry and `orders` (majority) for up to 3 s. Our order → `201`; closed key with no order → `409 IDEMPOTENCY_KEY_CLOSED`, `CONFIRMED_NOT_COMMITTED`; still absent, or a read fails → `503 CHECKOUT_RETRY`, `UNKNOWN`. Absence is **never** reported as "no order" |
+| Write conflicts with a concurrent checkout or reconcile | Retried within the budget (3 attempts, 10 s). The server never assumes a concurrent operation waits; if no definitive state is reached → `503`, `UNKNOWN` |
 | Retry budget exhausted (conflicts) | `503 CHECKOUT_RETRY`, `UNKNOWN` |
 
-Windows: `replayUntil` = server time recorded inside the creating transaction, before its commit, + 24 h. Key records are kept 30 days; the order keeps its key permanently, so a key never creates a second order even after its record is gone.
+Windows: `replayUntil` = server time recorded inside the creating transaction, before its commit, + 24 h. It only decides between `200` replay and `409`. Separately, the key registry is **permanent for the account's lifetime** (no TTL), so a used or closed key can never create an order, however late a delayed request arrives (DATABASE_DESIGN §4.5).
 
 Clients (M1-011):
 1. **Starting a checkout = explicit authorization.** A key is created only when the user presses "Place order", and only if this user has no unresolved pending checkout. Generate a random UUID. Before sending, store `{ key, request, firstSentAt, outcome: 'UNKNOWN' }` in `localStorage` under `pendingCheckout:v1:<userId>`.
@@ -249,13 +250,13 @@ Clients generate a new key only for a checkout the user explicitly starts, after
 
 Other errors: `409 OUT_OF_STOCK`, `409 PRODUCT_UNAVAILABLE`, `422 ORDER_LIMIT_EXCEEDED` (each with `outcome: CONFIRMED_NOT_COMMITTED`, because the key was fenced first), `409 IDEMPOTENCY_KEY_CLOSED`, `422 IDEMPOTENCY_KEY_REUSED`, `503 CHECKOUT_RETRY`.
 
-**POST `/api/orders/reconcile`**: session + CSRF required; rate limited (60/hour/user); body strict `{ "idempotencyKey": "<uuid>" }`. It returns the **definitive** outcome for one of the caller's own keys and **closes** the key, so the key can't create an order afterwards (DATABASE_DESIGN §7.2 *Fence*). Use it only to stop and decide; to complete a purchase, retry `POST /api/orders` with the same key instead.
+**POST `/api/orders/reconcile`**: session + CSRF required; rate limited (10/hour/user, which bounds registry growth); body strict `{ "idempotencyKey": "<uuid>" }`. It returns the **definitive** outcome for one of the caller's own keys and **closes** the key, so the key can't create an order afterwards (DATABASE_DESIGN §7.2 *Fence*). Use it only to stop and decide; to complete a purchase, retry `POST /api/orders` with the same key instead.
 
 | Result | Response |
 |---|---|
 | An order exists for `(session user, key)` | `200 { "data": { "outcome": "ORDER_FOUND", "order": OrderSummary } }` |
-| No order, and the key is now closed (tombstone majority-acknowledged, or already closed) | `200 { "data": { "outcome": "CONFIRMED_NOT_COMMITTED" } }` |
-| Couldn't be established (fence not acknowledged, record not yet majority-visible, timeout) | `503 CHECKOUT_RETRY`, `outcome: UNKNOWN`, `Retry-After`. Calling again is safe |
+| The key is durably closed (now or earlier) **and** a later majority read of `orders` finds no order | `200 { "data": { "outcome": "CONFIRMED_NOT_COMMITTED" } }` |
+| Couldn't be established (closure not acknowledged within 3 attempts / 5 s, a registry or `orders` read failed or timed out, record not yet majority-visible) | `503 CHECKOUT_RETRY`, `outcome: UNKNOWN`, `Retry-After`. Calling again is safe |
 | No session | `401`; nothing written |
 | Missing or invalid CSRF token | `403`; nothing written |
 
